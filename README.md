@@ -7,6 +7,14 @@ https://github.com/google-deepmind/tapnet/assets/4534987/9f66b81a-7efb-48e7-a59c
 <!-- disableFinding(LINE_OVER_80) -->
 Welcome to the official Google Deepmind repository for Tracking Any Point (TAP), home of the TAP-Vid and TAPVid-3D Datasets, our top-performing TAPIR model, and our RoboTAP extension.
 
+## Seismic training prototype
+
+This checkout contains an experimental synthetic-first TAPIR adaptation for
+fixed-lateral seismic reflector tracking. Its scope, commands, validation
+record, known omissions, and required future tests are maintained in
+[SEISMIC_TRAINING_README.md](SEISMIC_TRAINING_README.md). The prototype is not
+part of the upstream Google DeepMind implementation.
+
 - [TAP-Vid](https://tapvid.github.io) is a benchmark for models that perform this task, with a collection of ground-truth points for both real and synthetic videos.
 - [TAPIR](https://deepmind-tapir.github.io) is a two-stage algorithm which employs two stages: 1) a matching stage, which independently locates a suitable candidate point match for the query point on every other frame, and (2) a refinement stage, which updates both the trajectory and query features based on local correlations. The resulting model is fast and surpasses all prior methods by a significant margin on the TAP-Vid benchmark.
 - [RoboTAP](https://robotap.github.io) is a system which utilizes TAPIR point tracks to execute robotics manipulation tasks through efficient imitation in the real world. It also includes a dataset with ground-truth points annotated on real robotics manipulation videos.

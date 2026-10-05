@@ -29,7 +29,6 @@ import jax.numpy as jnp
 from jaxline import experiment
 from jaxline import platform
 from jaxline import utils
-from kubric.challenges.point_tracking import dataset
 from ml_collections import config_dict
 
 import numpy as np
@@ -39,6 +38,7 @@ import tensorflow_datasets as tfds
 
 from tapnet.models import tapir_model
 from tapnet.models import tapnet_model
+from tapnet.seismic import dataset as seismic_dataset
 from tapnet.training import supervised_point_prediction
 from tapnet.training import task
 from tapnet.utils import experiment_utils as exputils
@@ -259,15 +259,23 @@ class Experiment(experiment.AbstractExperiment):
     #
     # A dataset consists of a generator function (calling next() on it will
     # produce a data value)
+    def create_kubric_dataset(**kwargs):
+      # Kubric is optional for seismic-only training, so import it lazily.
+      # pylint: disable=g-import-not-at-top
+      from kubric.challenges.point_tracking import dataset
+      # pylint: enable=g-import-not-at-top
+      return dataset.create_point_tracking_dataset(**kwargs)
+
     dataset_constructors = {
-        'kubric': dataset.create_point_tracking_dataset,
+        'kubric': create_kubric_dataset,
+        'seismic': seismic_dataset.create_synthetic_seismic_dataset,
     }
     dataset_generators = {}
     for dset_name in self.config.datasets.dataset_names:
       ds_generator = self.create_dataset_generator(
           dataset_constructors,
           dset_name,
-          color_augmentation=True,
+          color_augmentation=dset_name == 'kubric',
       )
 
       dataset_generators[dset_name] = ds_generator

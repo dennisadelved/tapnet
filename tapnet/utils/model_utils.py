@@ -174,6 +174,86 @@ def tapnet_loss(
   return loss_huber, loss_occ, loss_prob
 
 
+def seismic_tapnet_loss(
+    points,
+    occlusion,
+    target_points,
+    target_occ,
+    expected_dist=None,
+    label_valid=None,
+    position_loss_weight=0.05,
+    depth_loss_weight=1.0,
+    lateral_loss_weight=0.25,
+    expected_dist_thresh=2.0,
+    huber_loss_delta=2.0,
+):
+  """TAPIR loss for fixed-lateral seismic reflector tracks.
+
+  Unlike ``tapnet_loss``, errors remain in native trace/sample coordinates and
+  depth and lateral errors are handled separately.  This avoids treating one
+  lateral trace as physically interchangeable with one depth sample.
+
+  Args:
+    points: Predicted tracks ``[batch, query, frame, (x, depth)]``.
+    occlusion: Predicted untrackable logits ``[batch, query, frame]``.
+    target_points: Ground-truth tracks in the same coordinates as ``points``.
+    target_occ: True where a reflector is known to be untrackable.
+    expected_dist: Optional logits predicting excessive depth error.
+    label_valid: True where either position/trackability label is known.  This
+      is distinct from ``target_occ``; absent annotations must not be treated as
+      geological terminations.
+    position_loss_weight: Overall position-loss multiplier.
+    depth_loss_weight: Relative depth-error weight.
+    lateral_loss_weight: Relative weight keeping tracks at the seed lateral.
+    expected_dist_thresh: Depth error in samples considered unreliable.
+    huber_loss_delta: Huber transition in native samples/traces.
+
+  Returns:
+    Weighted position loss, trackability BCE, and uncertainty BCE.
+  """
+  if label_valid is None:
+    label_valid = jnp.ones_like(target_occ)
+  valid = label_valid.astype(points.dtype)
+  visible_valid = valid * (1.0 - target_occ.astype(points.dtype))
+
+  def masked_mean(values, mask):
+    return jnp.sum(values * mask) / jnp.maximum(jnp.sum(mask), 1.0)
+
+  def scalar_huber(error):
+    absolute_error = jnp.abs(error)
+    return jnp.where(
+        absolute_error <= huber_loss_delta,
+        0.5 * jnp.square(error),
+        huber_loss_delta * (absolute_error - 0.5 * huber_loss_delta),
+    )
+
+  lateral_error = points[..., 0] - target_points[..., 0]
+  depth_error = points[..., 1] - target_points[..., 1]
+  depth_loss = masked_mean(scalar_huber(depth_error), visible_valid)
+  lateral_loss = masked_mean(scalar_huber(lateral_error), visible_valid)
+  loss_position = position_loss_weight * (
+      depth_loss_weight * depth_loss + lateral_loss_weight * lateral_loss
+  )
+
+  loss_occ = optax.sigmoid_binary_cross_entropy(
+      occlusion, target_occ.astype(occlusion.dtype)
+  )
+  loss_occ = masked_mean(loss_occ, valid)
+
+  if expected_dist is None:
+    loss_prob = 0.0
+  else:
+    excessive_depth_error = (
+        jnp.abs(jax.lax.stop_gradient(depth_error)) > expected_dist_thresh
+    ).astype(expected_dist.dtype)
+    loss_prob = optax.sigmoid_binary_cross_entropy(
+        expected_dist, excessive_depth_error
+    )
+    loss_prob = masked_mean(loss_prob, visible_valid)
+
+  return loss_position, loss_occ, loss_prob
+
+
 def interp(x: chex.Array, y: chex.Array, mode: str = 'nearest') -> chex.Array:
   """Bilinear interpolation.
 

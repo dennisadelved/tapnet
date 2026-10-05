@@ -59,6 +59,10 @@ class SupervisedPointPrediction(task.Task):
       contrastive_loss_weight: float = 0.05,
       position_loss_weight: float = 0.05,
       expected_dist_thresh: float = 6.0,
+      loss_type: str = 'tapnet',
+      depth_loss_weight: float = 1.0,
+      lateral_loss_weight: float = 0.25,
+      huber_loss_delta: float = 2.0,
       train_chunk_size: int = 32,
       eval_chunk_size: int = 16,
       eval_inference_resolution=(256, 256),
@@ -83,6 +87,12 @@ class SupervisedPointPrediction(task.Task):
       position_loss_weight: Weight for position loss.
       expected_dist_thresh: threshold for expected distance. Will be ignored if
         the model does not return expected_dist.
+      loss_type: ``tapnet`` for the upstream isotropic 256x256 loss or
+        ``seismic`` for fixed-lateral tracks in native trace/sample units.
+      depth_loss_weight: Depth term weight in the seismic position loss.
+      lateral_loss_weight: Lateral-lock term weight in the seismic position
+        loss.
+      huber_loss_delta: Huber transition in native units for seismic loss.
       train_chunk_size: Compute predictions on this many queries simultaneously.
         This saves memory as the cost volumes can be very large.
       eval_chunk_size: Compute predictions on this many queries simultaneously.
@@ -103,6 +113,12 @@ class SupervisedPointPrediction(task.Task):
     self.softmax_temperature = softmax_temperature
     self.position_loss_weight = position_loss_weight
     self.expected_dist_thresh = expected_dist_thresh
+    if loss_type not in ('tapnet', 'seismic'):
+      raise ValueError(f'Unsupported loss_type: {loss_type}')
+    self.loss_type = loss_type
+    self.depth_loss_weight = depth_loss_weight
+    self.lateral_loss_weight = lateral_loss_weight
+    self.huber_loss_delta = huber_loss_delta
     self.train_chunk_size = train_chunk_size
     self.eval_chunk_size = eval_chunk_size
     self.eval_inference_resolution = eval_inference_resolution
@@ -214,17 +230,39 @@ class SupervisedPointPrediction(task.Task):
     loss = 0.0
     # pytype: disable=unsupported-operands
     if self.prediction_algo in ['cost_volume_regressor']:
-      loss_huber, loss_occ, loss_prob = model_utils.tapnet_loss(
+      sample = inputs[input_key]
+
+      def compute_losses(tracks, occlusion, expected_dist):
+        if self.loss_type == 'seismic':
+          return model_utils.seismic_tapnet_loss(
+              tracks,
+              occlusion,
+              sample['target_points'],
+              sample['occluded'],
+              expected_dist=expected_dist,
+              label_valid=sample.get('label_valid'),
+              position_loss_weight=self.position_loss_weight,
+              depth_loss_weight=self.depth_loss_weight,
+              lateral_loss_weight=self.lateral_loss_weight,
+              expected_dist_thresh=self.expected_dist_thresh,
+              huber_loss_delta=self.huber_loss_delta,
+          )
+        return model_utils.tapnet_loss(
+            tracks,
+            occlusion,
+            sample['target_points'],
+            sample['occluded'],
+            sample['video'].shape,  # pytype: disable=attribute-error  # numpy-scalars
+            mask=sample.get('label_valid'),
+            expected_dist=expected_dist,
+            position_loss_weight=self.position_loss_weight,
+            expected_dist_thresh=self.expected_dist_thresh,
+        )
+
+      loss_huber, loss_occ, loss_prob = compute_losses(
           output['tracks'],
           output['occlusion'],
-          inputs[input_key]['target_points'],
-          inputs[input_key]['occluded'],
-          inputs[input_key]['video'].shape,  # pytype: disable=attribute-error  # numpy-scalars
-          expected_dist=output['expected_dist']
-          if 'expected_dist' in output
-          else None,
-          position_loss_weight=self.position_loss_weight,
-          expected_dist_thresh=self.expected_dist_thresh,
+          output.get('expected_dist'),
       )
       loss = loss_huber + loss_occ + loss_prob
       loss_scalars['position_loss'] = loss_huber
@@ -234,17 +272,12 @@ class SupervisedPointPrediction(task.Task):
 
       if 'unrefined_tracks' in output:
         for l in range(len(output['unrefined_tracks'])):
-          loss_huber, loss_occ, loss_prob = model_utils.tapnet_loss(
+          loss_huber, loss_occ, loss_prob = compute_losses(
               output['unrefined_tracks'][l],
               output['unrefined_occlusion'][l],
-              inputs[input_key]['target_points'],
-              inputs[input_key]['occluded'],
-              inputs[input_key]['video'].shape,  # pytype: disable=attribute-error  # numpy-scalars
-              expected_dist=output['unrefined_expected_dist'][l]
+              output['unrefined_expected_dist'][l]
               if 'unrefined_expected_dist' in output
               else None,
-              position_loss_weight=self.position_loss_weight,
-              expected_dist_thresh=self.expected_dist_thresh,
           )
           loss += loss_huber + loss_occ + loss_prob
           loss_scalars[f'position_loss_{l}'] = loss_huber
@@ -623,6 +656,79 @@ class SupervisedPointPrediction(task.Task):
       pred_occ = 1 - (1 - pred_occ) * (1 - jax.nn.sigmoid(expected_dist))
     pred_occ = pred_occ > 0.5  # threshold
 
+    if self.loss_type == 'seismic':
+      label_valid = inputs[input_key].get(
+          'label_valid', jnp.ones_like(gt_occluded)
+      ).astype(bool)
+      visible_valid = jnp.logical_and(label_valid, ~gt_occluded)
+      depth_error = jnp.abs(tracks[..., 1] - gt_target_points[..., 1])
+      lateral_error = jnp.abs(tracks[..., 0] - gt_target_points[..., 0])
+
+      def per_sample_mean(values, mask):
+        mask = mask.astype(values.dtype)
+        axes = tuple(range(1, values.ndim))
+        return jnp.sum(values * mask, axis=axes) / jnp.maximum(
+            jnp.sum(mask, axis=axes), 1.0
+        )
+
+      known_occ_loss = optax.sigmoid_binary_cross_entropy(
+          occlusion_logits, gt_occluded.astype(occlusion_logits.dtype)
+      )
+
+      def scalar_huber(error):
+        absolute_error = jnp.abs(error)
+        return jnp.where(
+            absolute_error <= self.huber_loss_delta,
+            0.5 * jnp.square(error),
+            self.huber_loss_delta
+            * (absolute_error - 0.5 * self.huber_loss_delta),
+        )
+
+      seismic_position_loss = self.position_loss_weight * (
+          self.depth_loss_weight
+          * per_sample_mean(scalar_huber(depth_error), visible_valid)
+          + self.lateral_loss_weight
+          * per_sample_mean(scalar_huber(lateral_error), visible_valid)
+      )
+      predicted_visible = ~pred_occ
+      true_visible = ~gt_occluded
+      visible_true_positive = (
+          predicted_visible & true_visible & label_valid
+      )
+      loss_scalars.update({
+          'loss_occ': per_sample_mean(known_occ_loss, label_valid),
+          'position_loss': seismic_position_loss,
+          'depth_mae_samples': per_sample_mean(depth_error, visible_valid),
+          'lateral_mae_traces': per_sample_mean(
+              lateral_error, visible_valid
+          ),
+          'within_1_sample': per_sample_mean(
+              depth_error <= 1.0, visible_valid
+          ),
+          'within_2_samples': per_sample_mean(
+              depth_error <= 2.0, visible_valid
+          ),
+          'within_4_samples': per_sample_mean(
+              depth_error <= 4.0, visible_valid
+          ),
+          'gross_error_over_8_samples': per_sample_mean(
+              depth_error > 8.0, visible_valid
+          ),
+          'trackability_accuracy': per_sample_mean(
+              pred_occ == gt_occluded, label_valid
+          ),
+          'visible_precision': per_sample_mean(
+              visible_true_positive, predicted_visible & label_valid
+          ),
+          'visible_recall': per_sample_mean(
+              visible_true_positive, true_visible & label_valid
+          ),
+      })
+      return loss_scalars, {
+          'tracks': tracks,
+          'occlusion': occlusion_logits,
+      }
+
     if self.eval_inference_resolution != self.eval_metrics_resolution:
       # Resize prediction and groundtruth to standard evaluation resolution
       query_points = transforms.convert_grid_coordinates(
@@ -683,7 +789,14 @@ class SupervisedPointPrediction(task.Task):
           to reach num_frames.
     """
     query_mode = 'first' if 'q_first' in mode else 'strided'
-    if 'eval_kubric_train' in mode:
+    if mode == 'eval_seismic_synthetic':
+      # pylint: disable=g-import-not-at-top
+      from tapnet.seismic import dataset as seismic_dataset
+      # pylint: enable=g-import-not-at-top
+      yield from seismic_dataset.create_synthetic_seismic_eval_dataset(
+          **dict(self.config.datasets.seismic_eval_kwargs)
+      )
+    elif 'eval_kubric_train' in mode:
       yield from evaluation_datasets.create_kubric_eval_train_dataset(
           mode, train_size=self.config.datasets.kubric_kwargs.train_size
       )
@@ -860,6 +973,8 @@ class SupervisedPointPrediction(task.Task):
 
     if 'eval_kinetics' in mode:
       input_key = 'kinetics'
+    elif 'eval_seismic' in mode:
+      input_key = 'seismic'
     elif 'eval_davis_points' in mode:
       input_key = 'davis'
     elif 'eval_jhmdb' in mode:
@@ -947,7 +1062,9 @@ class SupervisedPointPrediction(task.Task):
             lambda x: x / num_samples, summed_scalars
         )
       logging.info(mean_scalars)  # pyrefly: ignore[unbound-name]
-    logging.info(evaluation_datasets.latex_table(mean_scalars))  # pyrefly: ignore[bad-argument-type]
+    if 'eval_seismic' not in mode:
+      # pyrefly: ignore[bad-argument-type]
+      logging.info(evaluation_datasets.latex_table(mean_scalars))
 
     return mean_scalars
 

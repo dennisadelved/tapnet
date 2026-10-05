@@ -1,0 +1,6 @@
+# Install the appropriate JAX build for the training host first.
+# NVIDIA/Linux example: pip install --upgrade "jax[cuda13]"
+-e .
+tensorflow
+tensorflow-datasets
+tensorboard
