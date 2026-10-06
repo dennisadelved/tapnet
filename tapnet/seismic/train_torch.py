@@ -35,6 +35,9 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument('--checkpoint-every', type=int, default=100)
   parser.add_argument('--disable-amp', action='store_true')
   parser.add_argument(
+      '--amp-dtype', choices=('bfloat16', 'float16'), default=None
+  )
+  parser.add_argument(
       '--overfit-one-batch',
       action='store_true',
       help='Reuse one deterministic batch for the learning sanity check.',
@@ -142,6 +145,15 @@ def _move_batch(
   }
 
 
+def _clip_gradients(
+    model: torch.nn.Module, max_norm: float
+) -> torch.Tensor:
+  """Clips finite gradients and refuses an invalid optimizer update."""
+  return torch.nn.utils.clip_grad_norm_(
+      model.parameters(), max_norm, error_if_nonfinite=True
+  )
+
+
 def _config_signature(config: torch_config.TorchTrainingConfig) -> dict:
   serialized = dataclasses.asdict(config)
   return {
@@ -154,6 +166,8 @@ def _config_signature(config: torch_config.TorchTrainingConfig) -> dict:
           'num_pips_iter',
           'fixed_batch',
           'freeze_feature_encoder',
+          'amp_enabled',
+          'amp_dtype',
       )
   }
 
@@ -194,6 +208,10 @@ def main() -> None:
     config = dataclasses.replace(config, steps=args.steps)
   if args.overfit_one_batch:
     config = dataclasses.replace(config, fixed_batch=True)
+  if args.disable_amp:
+    config = dataclasses.replace(config, amp_enabled=False)
+  if args.amp_dtype is not None:
+    config = dataclasses.replace(config, amp_dtype=args.amp_dtype)
   output_dir = args.output_dir or Path(
       f'checkpoints/seismic_tapir_torch_{args.config}'
   )
@@ -257,8 +275,14 @@ def main() -> None:
   scheduler = torch.optim.lr_scheduler.LambdaLR(
       optimizer, lambda step: _lr_multiplier(step, config)
   )
-  amp_enabled = device.type == 'cuda' and not args.disable_amp
-  scaler = torch.amp.GradScaler('cuda', enabled=amp_enabled)
+  amp_enabled = device.type == 'cuda' and config.amp_enabled
+  amp_dtype = (
+      torch.bfloat16 if config.amp_dtype == 'bfloat16' else torch.float16
+  )
+  scaler_enabled = amp_enabled and amp_dtype == torch.float16
+  scaler = torch.amp.GradScaler('cuda', enabled=scaler_enabled)
+  precision = config.amp_dtype if amp_enabled else 'float32'
+  print(f'precision={precision}')
   if resume_state is not None:
     optimizer.load_state_dict(resume_state['optimizer'])
     scheduler.load_state_dict(resume_state['scheduler'])
@@ -290,7 +314,7 @@ def main() -> None:
     )
     optimizer.zero_grad(set_to_none=True)
     autocast = (
-        torch.amp.autocast('cuda', dtype=torch.float16)
+        torch.amp.autocast('cuda', dtype=amp_dtype)
         if amp_enabled
         else contextlib.nullcontext()
     )
@@ -308,9 +332,7 @@ def main() -> None:
       raise FloatingPointError(f'Non-finite loss at step {step + 1}: {loss}')
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
-    gradient_norm = torch.nn.utils.clip_grad_norm_(
-        model.parameters(), config.gradient_clip_norm
-    )
+    gradient_norm = _clip_gradients(model, config.gradient_clip_norm)
     scaler.step(optimizer)
     scaler.update()
     scheduler.step()

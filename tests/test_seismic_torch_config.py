@@ -25,3 +25,10 @@ def test_unknown_config_is_rejected():
   with pytest.raises(ValueError, match='Unknown PyTorch config'):
     torch_config.get_config('undocumented')
 
+
+def test_cuda_precision_defaults_to_bfloat16():
+  config = torch_config.get_config('vdi-small')
+
+  assert config.amp_enabled
+  assert config.amp_dtype == 'bfloat16'
+

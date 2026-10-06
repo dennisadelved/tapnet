@@ -260,6 +260,30 @@ artifact, not a CUDA or training failure. CUDA forward/backward, peak VRAM, and
 throughput remain unverified until the checkpoint is copied or downloaded and
 the command is rerun.
 
+Second VDI run on 2026-10-06 loaded the checkpoint and completed forward and
+backward execution with the feature encoder frozen, but it did **not** complete
+a valid optimizer update. FP16 produced finite loss `13.255537` but a non-finite
+pre-clipping gradient norm (`nan`). `GradScaler` therefore skipped
+`optimizer.step()`, after which the old trainer incorrectly advanced the learning
+rate scheduler, emitted a scheduler-order warning, and saved a checkpoint. That
+checkpoint is invalid and must not be resumed. Peak allocated CUDA memory was
+only 0.677 GiB, so this failure indicates numerical overflow rather than an
+out-of-memory condition.
+
+Corrective changes:
+
+- CUDA automatic mixed precision now defaults to BF16, which the L40 supports
+  and which has a substantially larger numerical range than FP16;
+- FP16 remains an explicit `--amp-dtype float16` option rather than the default;
+- `--disable-amp` provides the FP32 diagnostic path;
+- non-finite gradient norms now raise before the optimizer, scheduler, or
+  checkpoint save; and
+- precision settings are included in checkpoint compatibility checks.
+
+The required next gate is a one-step FP32 run, followed by BF16 with the updated
+trainer. Neither mode is recorded as successful until it reports a finite
+gradient norm without a scheduler warning.
+
 ### PyTorch alternative for a locked-down Windows VDI
 
 PyTorch is the preferred alternative if the VDI cannot provide WSL2 or a Linux
@@ -527,7 +551,7 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
-- Final combined `python -m pytest tests -q`: **29 passed**.
+- Final combined `python -m pytest tests -q`: **32 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -560,13 +584,17 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - A 20-step fixed-batch CPU sanity run reduced total deeply supervised loss from
   3.061385 to 1.707801. This demonstrates short-horizon learning but is not the
   near-zero overfit result required for model promotion.
-- Four generated CPU validation checkpoints totaling 2,164,837,932 bytes were
+- Five generated CPU validation checkpoints totaling 2,821,188,215 bytes were
   deleted after their save/resume behavior was verified. They are reproducible
   with the commands above. The 218,886,140-byte official pretrained checkpoint
   remains under the Git-ignored `checkpoints/pretrained/` directory.
 - A pretrained frozen-encoder checkpoint resumed for a second update with the
   encoder still frozen and the compatible optimizer state restored. Changing
   encoder trainability during resume is rejected; it requires a new run.
+- The precision-safety revision passed a fresh CPU trainer step with finite
+  gradient norm and no scheduler warning. A regression test injects NaN
+  gradients and verifies that checkpoint-producing training is rejected before
+  the optimizer step.
 
 The smoke evaluation followed a single random-weight update. Its numerical
 accuracy is intentionally not recorded as a benchmark because it provides no

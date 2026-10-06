@@ -25,6 +25,8 @@ class TorchTrainingConfig:
   seed: int = 0
   fixed_batch: bool = False
   freeze_feature_encoder: bool = False
+  amp_enabled: bool = True
+  amp_dtype: str = 'bfloat16'
 
   def validate(self) -> None:
     self.synthetic.validate()
@@ -42,6 +44,8 @@ class TorchTrainingConfig:
           'The first-pass config requires initial_resolution to match the '
           'synthetic image size.'
       )
+    if self.amp_dtype not in ('bfloat16', 'float16'):
+      raise ValueError('amp_dtype must be bfloat16 or float16.')
 
 
 def get_config(variant: str) -> TorchTrainingConfig:
