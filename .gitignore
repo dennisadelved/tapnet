@@ -22,5 +22,6 @@ share/python-wheels/
 .installed.cfg
 *.egg
 .venv/
+.venv-torch/
 checkpoints/
 MANIFEST

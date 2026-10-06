@@ -312,6 +312,31 @@ The FP32 result proves that the native-Windows CUDA training path and current
 constrained geometry fit comfortably in the 11 GB vGPU partition. The remaining
 precision gate is one BF16 step with the updated default configuration.
 
+BF16 VDI gate completed successfully on 2026-10-06:
+
+```text
+device                    cuda
+gpu                       NVIDIA L40-12Q
+feature encoder           frozen
+precision                 bfloat16
+loss                      12.852102
+position loss             1.043687
+occlusion loss            1.469949
+probability loss          0.502973
+pre-clipping gradient     2185.319092
+learning rate used        0.00000100
+peak allocated CUDA       0.815 GiB
+checkpoint                saved
+```
+
+The BF16 update had finite gradients, no scheduler warning, and valid checkpoint
+output. BF16 is therefore the preferred VDI precision. The pre-clipping gradient
+norm is nearly twice the FP32 smoke value and was clipped to 1.0. This does not
+invalidate the execution gate, but it prevents treating the one-step result as
+evidence of stable optimization. Do not begin the full 2,000-step experiment
+until a fixed-batch BF16 run demonstrates a sustained loss decrease without
+non-finite values.
+
 ### PyTorch alternative for a locked-down Windows VDI
 
 PyTorch is the preferred alternative if the VDI cannot provide WSL2 or a Linux
