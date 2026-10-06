@@ -358,11 +358,16 @@ also sums supervision for four unrefined TAPIR predictions; those intermediate
 components are currently calculated but not printed. Their residual loss means
 that the complete deep-supervision overfit gate is only partially passed.
 
-The supplied console capture ends immediately after the step-100 line. It does
-not contain the expected `checkpoint=...`, `peak_cuda_memory_gib=...`, or a
-returned PowerShell prompt. Checkpoint persistence and peak memory for this
-specific run therefore remain unverified even though all 100 training updates
-completed.
+The initial console capture ended immediately after the step-100 line, but the
+complete output subsequently confirmed normal completion:
+
+```text
+checkpoint=checkpoints\seismic_tapir_torch_vdi_bf16_overfit100\latest.pt
+peak_cuda_memory_gib=0.874
+```
+
+The 100-step run therefore saved its intended checkpoint and remained far below
+the 11 GB vGPU allocation in peak memory reported by PyTorch.
 
 ### PyTorch alternative for a locked-down Windows VDI
 
@@ -400,9 +405,8 @@ Known omissions and risks:
   aggregate intermediate-refinement loss remains non-zero and is not logged;
 - exact parity with the JAX checkpoint/training trajectory is not expected;
 - the current JAX/JAXline configuration cannot be reused directly;
-- peak allocated VRAM for one-step runs is approximately 0.815 GiB, but the
-  peak for the 100-step run was not present in the supplied console capture;
-  and
+- peak allocated VRAM was approximately 0.815 GiB for the one-step BF16 run and
+  0.874 GiB for the 100-step fixed-batch BF16 run; and
 - corporate package-index and checkpoint-download policies may require an
   offline wheel/checkpoint transfer.
 
@@ -694,8 +698,9 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
   from 12.852102 to 0.775462; final position loss fell from 1.043687 to
   0.005962; and final occlusion/probability losses fell to approximately zero.
   The remaining total is attributed to the four supervised unrefined outputs,
-  which are not yet included in console logging. The supplied capture did not
-  show the post-step checkpoint or peak-memory messages.
+  which are not yet included in console logging. The checkpoint was saved to
+  `checkpoints/seismic_tapir_torch_vdi_bf16_overfit100/latest.pt`, and PyTorch
+  reported 0.874 GiB peak allocated CUDA memory.
 
 The smoke evaluation followed a single random-weight update. Its numerical
 accuracy is intentionally not recorded as a benchmark because it provides no
