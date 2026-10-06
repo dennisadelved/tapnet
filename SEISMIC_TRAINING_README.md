@@ -180,6 +180,43 @@ Reported target VDI on 2026-10-05:
 - shared GPU memory: 192 GB; and
 - Windows device driver version: 32.0.15.8253, dated 2026-04-15.
 
+Environment probe on 2026-10-06:
+
+```text
+torch.__version__          2.14.1+cpu
+torch.cuda.is_available()  False
+torch.version.cuda         None
+device                     GPU unavailable
+```
+
+This result proves that the CPU-only PyTorch wheel was installed; it does not
+yet prove that CUDA compute is blocked by the VDI. The next test is to replace
+that wheel with the official Windows CUDA 12.6 build:
+
+```powershell
+.venv-torch\Scripts\python.exe -m pip uninstall -y torch
+.venv-torch\Scripts\python.exe -m pip install torch --index-url https://download.pytorch.org/whl/cu126
+```
+
+CUDA 12.6 is selected conservatively for the first VDI test. Do not install the
+CPU requirements again between this command and the CUDA verification, because
+an incorrectly configured package source could replace the CUDA wheel.
+
+Correction recorded on 2026-10-06: the first version of
+`requirements_seismic_torch.txt` included an unqualified `torch` entry. Following
+the documented setup could therefore install the default CPU wheel. That was a
+project setup defect, not a user error. The entry has been removed; PyTorch must
+now be installed explicitly from the selected CUDA wheel index before installing
+the remaining requirements.
+
+Second clean-environment correction recorded on 2026-10-06: the first
+PyTorch-only requirements list omitted `dm-tree`. The official TAPIR PyTorch
+model imports it as `tree`, while the development environment already had it as
+a transitive JAX-side dependency and therefore hid the omission. The target VDI
+correctly failed with `ModuleNotFoundError: No module named 'tree'`. `dm-tree`
+has been added explicitly. The audited direct third-party imports for the
+PyTorch seismic path are now PyTorch itself, NumPy, `einshape`, and `dm-tree`.
+
 The shared-memory figure is system RAM and must not be counted as CUDA device
 memory for JAX/XLA capacity planning. The effective training ceiling is the
 11 GB vGPU framebuffer, less display and other-process usage. The `-12Q` profile
@@ -212,6 +249,16 @@ The VDI CUDA path is currently **unverified**. Required evidence is the output
 of the commands above followed by a successful CUDA forward/backward smoke run.
 The 11 GB profile may still require further reduction; do not infer usable
 memory from the 203 GB combined Task Manager figure.
+
+VDI update on 2026-10-06: the CUDA-enabled PyTorch environment successfully
+reported `device=cuda` and `gpu=NVIDIA L40-12Q`. This proves that native-Windows
+PyTorch can access the assigned vGPU. The first training attempt then stopped
+before model construction with `FileNotFoundError` for
+`checkpoints/pretrained/bootstapir_checkpoint_v2.pt`. This is expected when the
+repository is cloned because `checkpoints/` is Git-ignored. It is a missing
+artifact, not a CUDA or training failure. CUDA forward/backward, peak VRAM, and
+throughput remain unverified until the checkpoint is copied or downloaded and
+the command is rerun.
 
 ### PyTorch alternative for a locked-down Windows VDI
 

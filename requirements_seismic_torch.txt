@@ -2,7 +2,9 @@
 # Use https://pytorch.org/get-started/locally/ to select Windows, Pip, and CUDA.
 # This intentionally does not install the project through pyproject.toml because
 # the upstream base dependencies currently include JAX.
+# PyTorch is intentionally omitted here: an unqualified `torch` requirement can
+# install a CPU-only wheel and replace the explicitly selected CUDA build.
 numpy
 einshape
-torch
+dm-tree
 
