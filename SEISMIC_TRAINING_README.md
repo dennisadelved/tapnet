@@ -245,10 +245,10 @@ Interpretation:
    VDI policy is blocking compute access and must be handled by the provider.
 4. WSL2 or a Linux container is needed only if retaining JAX GPU training.
 
-The VDI CUDA path is currently **unverified**. Required evidence is the output
-of the commands above followed by a successful CUDA forward/backward smoke run.
-The 11 GB profile may still require further reduction; do not infer usable
-memory from the 203 GB combined Task Manager figure.
+At this stage of setup the VDI CUDA path was unverified. The later validation
+records below supersede that initial status: CUDA forward/backward now works on
+the L40-12Q. The 11 GB profile remains the real device-memory limit; do not
+infer usable VRAM from the 203 GB combined Task Manager figure.
 
 VDI update on 2026-10-06: the CUDA-enabled PyTorch environment successfully
 reported `device=cuda` and `gpu=NVIDIA L40-12Q`. This proves that native-Windows
@@ -280,9 +280,9 @@ Corrective changes:
   checkpoint save; and
 - precision settings are included in checkpoint compatibility checks.
 
-The required next gate is a one-step FP32 run, followed by BF16 with the updated
-trainer. Neither mode is recorded as successful until it reports a finite
-gradient norm without a scheduler warning.
+The required next gate at that point was a one-step FP32 run followed by BF16
+with the updated trainer. Both later completed with finite gradient norms and
+without a scheduler warning, as recorded below.
 
 FP32 VDI gate completed successfully on 2026-10-06:
 
@@ -332,10 +332,37 @@ checkpoint                saved
 The BF16 update had finite gradients, no scheduler warning, and valid checkpoint
 output. BF16 is therefore the preferred VDI precision. The pre-clipping gradient
 norm is nearly twice the FP32 smoke value and was clipped to 1.0. This does not
-invalidate the execution gate, but it prevents treating the one-step result as
-evidence of stable optimization. Do not begin the full 2,000-step experiment
-until a fixed-batch BF16 run demonstrates a sustained loss decrease without
-non-finite values.
+invalidate the execution gate, but the one-step result alone was not evidence
+of stable optimization. The fixed-batch run below subsequently supplied that
+evidence; held-out evaluation and intermediate-loss inspection still block the
+full 2,000-step experiment.
+
+The 100-step fixed-batch BF16 VDI run completed all optimizer steps on
+2026-10-06 without a non-finite loss or gradient:
+
+```text
+                              step 1          step 100
+total deeply supervised loss  12.852102       0.775462
+final position loss             1.043687       0.005962
+final occlusion loss            1.469949       0.000000
+final probability loss          0.502973       0.000001
+pre-clipping gradient norm   2185.319092       8.531075
+learning rate used              0.000001       0.000100
+```
+
+This is a 94.0% decrease in total loss and a 99.4% decrease in the final-head
+position loss. It validates sustained BF16 optimization on the L40-12Q and
+shows that the final prediction head can memorize the fixed synthetic batch.
+The reported total is higher than the three displayed components because it
+also sums supervision for four unrefined TAPIR predictions; those intermediate
+components are currently calculated but not printed. Their residual loss means
+that the complete deep-supervision overfit gate is only partially passed.
+
+The supplied console capture ends immediately after the step-100 line. It does
+not contain the expected `checkpoint=...`, `peak_cuda_memory_gib=...`, or a
+returned PowerShell prompt. Checkpoint persistence and peak memory for this
+specific run therefore remain unverified even though all 100 training updates
+completed.
 
 ### PyTorch alternative for a locked-down Windows VDI
 
@@ -368,13 +395,14 @@ Implemented scope:
 
 Known omissions and risks:
 
-- no CUDA run has been performed on the target VDI;
 - no PyTorch evaluation command or seismic-metric report exists yet;
-- the short fixed-batch sanity check reduces loss, but near-zero overfit and
-  convergence have not passed;
+- the BF16 fixed-batch run drives the final-head losses near zero, but the
+  aggregate intermediate-refinement loss remains non-zero and is not logged;
 - exact parity with the JAX checkpoint/training trajectory is not expected;
 - the current JAX/JAXline configuration cannot be reused directly;
-- peak VRAM on the L40-12Q is unknown; and
+- peak allocated VRAM for one-step runs is approximately 0.815 GiB, but the
+  peak for the 100-step run was not present in the supplied console capture;
+  and
 - corporate package-index and checkpoint-download policies may require an
   offline wheel/checkpoint transfer.
 
@@ -565,6 +593,19 @@ python -m tapnet.seismic.train_torch `
   --checkpoint-every 20
 ```
 
+The validated pretrained VDI version of this gate is:
+
+```powershell
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 100 `
+  --device cuda `
+  --overfit-one-batch `
+  --pretrained-checkpoint checkpoints\pretrained\bootstapir_checkpoint_v2.pt `
+  --output-dir checkpoints\seismic_tapir_torch_vdi_bf16_overfit100 `
+  --checkpoint-every 100
+```
+
 Create a visual sample:
 
 ```bash
@@ -648,6 +689,13 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
   gradient norm and no scheduler warning. A regression test injects NaN
   gradients and verifies that checkpoint-producing training is rejected before
   the optimizer step.
+- A 100-step pretrained, frozen-encoder, fixed-batch BF16 run completed on the
+  Windows L40-12Q without non-finite values. Total deeply supervised loss fell
+  from 12.852102 to 0.775462; final position loss fell from 1.043687 to
+  0.005962; and final occlusion/probability losses fell to approximately zero.
+  The remaining total is attributed to the four supervised unrefined outputs,
+  which are not yet included in console logging. The supplied capture did not
+  show the post-step checkpoint or peak-memory messages.
 
 The smoke evaluation followed a single random-weight update. Its numerical
 accuracy is intentionally not recorded as a benchmark because it provides no
@@ -659,12 +707,13 @@ These omissions are material and must not be inferred as implemented:
 
 1. **No useful model has been trained.** The default 20,000-step configuration
    has not been run on a GPU, tuned, or shown to converge.
-2. **The one-batch overfit gate is incomplete.** A 20-step fixed-batch run
-   reduced loss substantially, but did not approach zero and was not run with
-   pretrained weights or on CUDA.
-3. **Pretrained initialization is only CPU-validated.** The official PyTorch
-   BootsTAPIR checkpoint loads strictly and one frozen-encoder update completed,
-   but CUDA memory use, learning, and generalization are unverified.
+2. **The complete one-batch overfit gate is partially passed.** On CUDA BF16,
+   the pretrained frozen-encoder model drives the final-head losses near zero,
+   but the sum over intermediate refinement outputs remains `0.775462` at step
+   100. Per-refinement logging and a longer run are still required.
+3. **Pretrained CUDA optimization is validated, not generalization.** The
+   official PyTorch BootsTAPIR checkpoint loads strictly and completed 100
+   frozen-encoder BF16 updates. No held-out PyTorch evaluation has been run.
 4. **No real-volume reader.** SEG-Y, ZGY, NumPy cube, horizon-grid ingestion,
    survey normalization, inline/crossline metadata, and real-data split logic do
    not exist yet.
@@ -689,10 +738,9 @@ These omissions are material and must not be inferred as implemented:
     high-confidence pseudo-label training are future work.
 11. **No physical-unit metrics.** Errors are in samples and traces, not
     milliseconds, metres, or survey coordinates.
-12. **No GPU or distributed training validation.** Single-device CPU updates and
-    checkpoint restoration were performed. GPU memory use, throughput, mixed
-    precision, multi-GPU reduction, and exact numerical restart parity have not
-    been tested.
+12. **GPU validation is limited to one VDI.** Single-device CUDA BF16/FP32
+    updates work on the L40-12Q. Throughput, multi-GPU reduction, long-run memory
+    behavior, and exact numerical restart parity have not been tested.
 13. **No prestack support.** The current input represents one scalar post-stack
     amplitude repeated into three channels.
 14. **No data-volume caching/profile.** Synthetic generation is online and has
@@ -702,9 +750,10 @@ These omissions are material and must not be inferred as implemented:
 
 ### P0: establish that the prototype can learn
 
-1. Extend the fixed-batch mode until depth error is near zero, first with the
-   frozen pretrained model and then, if needed, selected layers unfrozen.
-   Failure blocks all larger experiments.
+1. Print aggregate or per-refinement losses during fixed-batch training, then
+   extend the BF16 run to determine whether every deeply supervised refinement
+   output can overfit. The final output already reaches near-zero error; failure
+   of the intermediate outputs to improve blocks larger experiments.
 2. Run the default tensor shapes for several steps on the target GPU and record
    peak memory, compile time, and examples/second.
 3. Train on a small fixed synthetic train/validation split and plot every loss
