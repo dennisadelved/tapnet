@@ -116,8 +116,18 @@ DeepMind's official `tapnet.torch.tapir_model.TAPIR` implementation. It includes
 - atomic `latest.pt` checkpoints containing model, optimizer, scheduler,
   gradient-scaler, step, and configuration state;
 - exact synthetic-stream continuation on resume;
-- an explicit `--overfit-one-batch` learning sanity-check mode; and
+- an explicit `--overfit-one-batch` learning sanity-check mode;
+- aggregate intermediate loss plus per-stage position, occlusion, probability,
+  and total loss logging for every deeply supervised unrefined output; and
 - CUDA peak allocated-memory reporting at process exit.
+
+For `vdi-small`, `stage_0` is the initial cost-volume prediction and
+`stage_1` through `stage_3` are the unrefined mixer predictions. The ordinary
+`position_loss`, `occlusion_loss`, and `probability_loss` fields refer to the
+final model output. `intermediate_loss` is the sum of all four stage totals;
+the optimization objective remains `loss = final losses + intermediate_loss`.
+This is a logging-only change and does not alter checkpoint compatibility or
+loss weighting.
 
 The upstream PyTorch inference model used an in-place residual addition in
 `tapnet/torch/nets.py`. It was changed to an equivalent out-of-place addition
@@ -369,6 +379,34 @@ peak_cuda_memory_gib=0.874
 The 100-step run therefore saved its intended checkpoint and remained far below
 the 11 GB vGPU allocation in peak memory reported by PyTorch.
 
+The same fixed batch was then resumed from step 100 through step 300. This was
+run before intermediate-loss logging was added, so it provides an optimization
+result but does not isolate the residual loss:
+
+```text
+                              step 100        step 300
+total deeply supervised loss   0.775462        0.480608
+final position loss            0.005962        0.000027
+final occlusion loss            0.000000        0.000000
+final probability loss          0.000001        0.000000
+pre-clipping gradient norm      8.531075        0.587641
+learning rate used              0.000100        0.00000101
+checkpoint                    checkpoints/seismic_tapir_torch_vdi_bf16_overfit300/latest.pt
+peak allocated CUDA           0.876 GiB
+```
+
+The continuation was numerically stable and reduced the residual total loss by
+38.0%, while the final output converged essentially to zero loss. At step 300,
+approximately `0.480581` of the `0.480608` total comes from unprinted unrefined
+outputs. The learning-rate schedule had also reached its approximately `1e-6`
+floor. Continuing this same schedule without first identifying the responsible
+stage and loss term is not a useful diagnostic.
+
+The frozen feature encoder uses `InstanceNorm2d` with
+`track_running_stats=False`, not running-stat BatchNorm. Calling `model.train()`
+therefore does not silently change normalization statistics in the frozen
+encoder and does not explain the intermediate-loss plateau.
+
 ### PyTorch alternative for a locked-down Windows VDI
 
 PyTorch is the preferred alternative if the VDI cannot provide WSL2 or a Linux
@@ -401,8 +439,9 @@ Implemented scope:
 Known omissions and risks:
 
 - no PyTorch evaluation command or seismic-metric report exists yet;
-- the BF16 fixed-batch run drives the final-head losses near zero, but the
-  aggregate intermediate-refinement loss remains non-zero and is not logged;
+- the 300-step BF16 fixed-batch run drives the final-head losses near zero, but
+  approximately 0.480581 aggregate intermediate-refinement loss remains and is
+  not separated by stage or loss term;
 - exact parity with the JAX checkpoint/training trajectory is not expected;
 - the current JAX/JAXline configuration cannot be reused directly;
 - peak allocated VRAM was approximately 0.815 GiB for the one-step BF16 run and
@@ -610,6 +649,26 @@ The validated pretrained VDI version of this gate is:
   --checkpoint-every 100
 ```
 
+After updating to the per-stage logger, inspect the step-300 checkpoint with
+one additional update:
+
+```powershell
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 301 `
+  --device cuda `
+  --overfit-one-batch `
+  --resume checkpoints\seismic_tapir_torch_vdi_bf16_overfit300\latest.pt `
+  --output-dir checkpoints\seismic_tapir_torch_vdi_bf16_diagnostic301 `
+  --checkpoint-every 1
+```
+
+The first output line reports the final and aggregate intermediate losses. The
+following `intermediate_step=301` line reports position, occlusion,
+probability, and total loss for stages 0 through 3. This diagnostic uses the
+existing optimizer state and approximately `1e-6` learning-rate floor; it is
+not a new training experiment.
+
 Create a visual sample:
 
 ```bash
@@ -649,7 +708,7 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
-- Final combined `python -m pytest tests -q`: **32 passed**.
+- Final combined `python -m pytest tests -q`: **33 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -701,6 +760,16 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
   which are not yet included in console logging. The checkpoint was saved to
   `checkpoints/seismic_tapir_torch_vdi_bf16_overfit100/latest.pt`, and PyTorch
   reported 0.874 GiB peak allocated CUDA memory.
+- Resuming the same fixed batch through step 300 reduced total loss from
+  0.775462 at step 100 to 0.480608, while final position loss reached 0.000027
+  and both final classification losses rounded to zero. All gradients remained
+  finite, `latest.pt` was saved, and peak allocated CUDA memory was 0.876 GiB.
+  The remaining approximately 0.480581 loss belongs to unprinted intermediate
+  outputs, and the learning rate had reached approximately `1e-6`.
+- Intermediate diagnostics now report the aggregate unrefined loss and the
+  position, occlusion, probability, and total loss for each unrefined stage.
+  Tests verify exact loss accounting and the console format. This logging-only
+  revision passed the full 33-test suite and retains checkpoint compatibility.
 
 The smoke evaluation followed a single random-weight update. Its numerical
 accuracy is intentionally not recorded as a benchmark because it provides no
@@ -714,8 +783,9 @@ These omissions are material and must not be inferred as implemented:
    has not been run on a GPU, tuned, or shown to converge.
 2. **The complete one-batch overfit gate is partially passed.** On CUDA BF16,
    the pretrained frozen-encoder model drives the final-head losses near zero,
-   but the sum over intermediate refinement outputs remains `0.775462` at step
-   100. Per-refinement logging and a longer run are still required.
+   but the sum over intermediate refinement outputs remains approximately
+   `0.480581` at step 300. Per-stage and per-loss-term logging is required before
+   deciding whether to change supervision, trainability, or optimization.
 3. **Pretrained CUDA optimization is validated, not generalization.** The
    official PyTorch BootsTAPIR checkpoint loads strictly and completed 100
    frozen-encoder BF16 updates. No held-out PyTorch evaluation has been run.
@@ -755,10 +825,11 @@ These omissions are material and must not be inferred as implemented:
 
 ### P0: establish that the prototype can learn
 
-1. Print aggregate or per-refinement losses during fixed-batch training, then
-   extend the BF16 run to determine whether every deeply supervised refinement
-   output can overfit. The final output already reaches near-zero error; failure
-   of the intermediate outputs to improve blocks larger experiments.
+1. Print per-stage position, occlusion, and probability losses, then perform one
+   diagnostic forward/update from the step-300 checkpoint. The final output is
+   already near zero; identify the exact intermediate term responsible for the
+   approximately 0.480581 residual before changing the model or running a
+   longer schedule.
 2. Run the default tensor shapes for several steps on the target GPU and record
    peak memory, compile time, and examples/second.
 3. Train on a small fixed synthetic train/validation split and plot every loss

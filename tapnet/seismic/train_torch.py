@@ -154,6 +154,28 @@ def _clip_gradients(
   )
 
 
+def _format_intermediate_scalars(
+    scalars: Mapping[str, torch.Tensor],
+) -> str:
+  """Formats every deeply supervised unrefined output for diagnostics."""
+  stage_indices = sorted(
+      int(name.removeprefix('position_loss_'))
+      for name in scalars
+      if name.startswith('position_loss_')
+  )
+  fields = []
+  for index in stage_indices:
+    for label, scalar_name in (
+        ('position', f'position_loss_{index}'),
+        ('occlusion', f'occlusion_loss_{index}'),
+        ('probability', f'probability_loss_{index}'),
+        ('total', f'loss_{index}'),
+    ):
+      value = float(scalars[scalar_name].detach())
+      fields.append(f'stage_{index}_{label}={value:.6f}')
+  return ' '.join(fields)
+
+
 def _config_signature(config: torch_config.TorchTrainingConfig) -> dict:
   serialized = dataclasses.asdict(config)
   return {
@@ -339,16 +361,25 @@ def main() -> None:
     scheduler.step()
 
     completed_step = step + 1
+    summary_names = (
+        'loss',
+        'position_loss',
+        'occlusion_loss',
+        'probability_loss',
+        'intermediate_loss',
+    )
     scalar_text = ' '.join(
-        f'{name}={float(value.detach()):.6f}'
-        for name, value in scalars.items()
-        if name in ('loss', 'position_loss', 'occlusion_loss', 'probability_loss')
+        f'{name}={float(scalars[name].detach()):.6f}'
+        for name in summary_names
     )
     print(
         f'step={completed_step}/{config.steps} {scalar_text} '
         f'gradient_norm={float(gradient_norm):.6f} '
         f'lr={learning_rate:.8f}'
     )
+    intermediate_text = _format_intermediate_scalars(scalars)
+    if intermediate_text:
+      print(f'intermediate_step={completed_step} {intermediate_text}')
 
     if completed_step % args.checkpoint_every == 0:
       checkpoint = _save_checkpoint(

@@ -106,4 +106,10 @@ def test_intermediate_predictions_are_deeply_supervised():
   )
 
   assert float(total.detach()) == pytest.approx(2.0 * float(final.detach()))
+  assert float(scalars['loss_0'].detach()) == pytest.approx(
+      float(final.detach())
+  )
+  assert float(scalars['intermediate_loss'].detach()) == pytest.approx(
+      float(final.detach())
+  )
 

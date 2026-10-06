@@ -114,6 +114,7 @@ def seismic_supervised_loss(
       'occlusion_loss': occurrence,
       'probability_loss': probability,
   }
+  intermediate_total = total.new_zeros(())
 
   unrefined_tracks = outputs.get('unrefined_tracks', ())
   unrefined_occlusion = outputs.get('unrefined_occlusion', ())
@@ -129,11 +130,15 @@ def seismic_supervised_loss(
     step_position, step_occurrence, step_probability = compute(
         tracks, occlusion, expected
     )
-    total = total + step_position + step_occurrence + step_probability
+    step_total = step_position + step_occurrence + step_probability
+    intermediate_total = intermediate_total + step_total
+    total = total + step_total
     scalars[f'position_loss_{index}'] = step_position
     scalars[f'occlusion_loss_{index}'] = step_occurrence
     scalars[f'probability_loss_{index}'] = step_probability
+    scalars[f'loss_{index}'] = step_total
 
+  scalars['intermediate_loss'] = intermediate_total
   scalars['loss'] = total
   return total, scalars
 
