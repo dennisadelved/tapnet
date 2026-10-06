@@ -67,6 +67,12 @@ device batching. The Kubric import was made lazy so Kubric is not required for
 seismic-only training. Natural-video colour augmentation is disabled for the
 seismic dataset.
 
+`tapnet/seismic/torch_data.py` provides a separate
+`torch.utils.data.IterableDataset`. It does not import TensorFlow or JAX. Each
+sample is derived from `(base_seed, sample_index)`, so restarting at a saved
+training step resumes the same deterministic sample sequence without replaying
+all preceding synthetic examples.
+
 ### Seismic loss
 
 `tapnet.utils.model_utils.seismic_tapnet_loss` adds:
@@ -90,6 +96,41 @@ expected_dist_thresh = 2 depth samples
 ```
 
 These are starting values, not tuned values.
+
+`tapnet/seismic/torch_losses.py` ports the same objective to PyTorch, including
+valid-label masking and losses on every unrefined TAPIR prediction. Fixed-tensor
+tests cover weighting, masks, intermediate supervision, and finite gradients.
+
+### Native-Windows PyTorch trainer
+
+`tapnet/seismic/train_torch.py` is a single-device trainer using Google
+DeepMind's official `tapnet.torch.tapir_model.TAPIR` implementation. It includes:
+
+- native PyTorch data loading with batch size one;
+- CUDA automatic mixed precision, disabled automatically on CPU;
+- AdamW with the current learning rate, beta, gradient clipping, weight decay,
+  warmup, and cosine-decay intent;
+- bias parameters excluded from weight decay to approximate the JAX optimizer;
+- optional official PyTorch checkpoint initialization;
+- default feature-encoder freezing when a pretrained checkpoint is supplied;
+- atomic `latest.pt` checkpoints containing model, optimizer, scheduler,
+  gradient-scaler, step, and configuration state;
+- exact synthetic-stream continuation on resume;
+- an explicit `--overfit-one-batch` learning sanity-check mode; and
+- CUDA peak allocated-memory reporting at process exit.
+
+The upstream PyTorch inference model used an in-place residual addition in
+`tapnet/torch/nets.py`. It was changed to an equivalent out-of-place addition
+because the in-place form invalidated tensors required by autograd. A full-model
+forward/backward test protects this requirement.
+
+`tapnet/seismic/torch_config.py` contains two explicit variants:
+
+- `smoke`: 64-by-64, 2 frames, 2 queries, one refinement iteration, one step,
+  random initialization, and plumbing validation only.
+- `vdi-small`: 128-by-128, 8 frames, 16 queries, the checkpoint-compatible
+  pyramid, and 2,000 planned steps. This is the initial L40-12Q experiment, not
+  a tuned final configuration.
 
 ### Evaluation
 
@@ -118,16 +159,221 @@ latest checkpoint instead of waiting for new checkpoints.
   dots are visible targets and hollow red dots are known terminations.
 - Unit tests cover shapes, data types, amplitude range, coordinate ordering,
   fixed-lateral targets, termination semantics, reproducibility, configuration
-  validation, TensorFlow wrapping, JAX loss masking/weighting, and finite loss
-  gradients.
+  validation, TensorFlow and PyTorch wrapping, JAX/PyTorch loss
+  masking/weighting, finite gradients, deterministic resume samples, and a full
+  PyTorch TAPIR backward pass.
 
 ## Setup
 
-Use Linux or a Linux GPU container for actual training. Native Windows JAX is
-CPU-only; it is sufficient for the smoke test but not the default training run.
+There are now two framework paths. JAX/JAXline remains the reference and needs
+Linux or WSL2 for NVIDIA GPU training. PyTorch is the recommended target for the
+locked-down Windows VDI because official PyTorch CUDA wheels support native
+Windows. Do not mix their checkpoints or environment instructions.
+
+### Target Windows VDI: no-admin feasibility gate
+
+Reported target VDI on 2026-10-05:
+
+- vGPU profile: NVIDIA L40-12Q;
+- dedicated GPU memory visible to the VDI: 11.0 GB;
+- dedicated memory already in use when inspected in Task Manager: 4.6 GB;
+- shared GPU memory: 192 GB; and
+- Windows device driver version: 32.0.15.8253, dated 2026-04-15.
+
+The shared-memory figure is system RAM and must not be counted as CUDA device
+memory for JAX/XLA capacity planning. The effective training ceiling is the
+11 GB vGPU framebuffer, less display and other-process usage. The `-12Q` profile
+is a partition of an L40; it does not expose the physical L40's full memory.
+
+No-admin installation of Python packages in a virtual environment is possible,
+but that does not bypass the operating-system requirement: the official JAX
+CUDA wheels run on Linux, not native Windows. A Conda or `venv` environment on
+native Windows therefore cannot make this training code use the vGPU.
+
+Before requesting any VDI change, run these non-administrative PowerShell checks:
+
+```powershell
+nvidia-smi
+where.exe python
+py -0p
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.version.cuda); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'GPU unavailable')"
+```
+
+Interpretation:
+
+1. If PyTorch reports CUDA and the L40-12Q, use the native-Windows PyTorch path.
+2. If PyTorch is absent, install an approved CUDA wheel into a user-owned
+   virtual environment; administrator access is normally unnecessary.
+3. If a CUDA-enabled PyTorch wheel reports no GPU, the vGPU driver, license, or
+   VDI policy is blocking compute access and must be handled by the provider.
+4. WSL2 or a Linux container is needed only if retaining JAX GPU training.
+
+The VDI CUDA path is currently **unverified**. Required evidence is the output
+of the commands above followed by a successful CUDA forward/backward smoke run.
+The 11 GB profile may still require further reduction; do not infer usable
+memory from the 203 GB combined Task Manager figure.
+
+### PyTorch alternative for a locked-down Windows VDI
+
+PyTorch is the preferred alternative if the VDI cannot provide WSL2 or a Linux
+container. Official PyTorch CUDA wheels support Windows, and installing a wheel
+inside a user-owned virtual environment normally does not require administrator
+rights. GPU access still depends on the VDI driver, vGPU license/policy, and the
+ability to download or obtain the approved wheel.
+
+This repository already contains Google DeepMind's PyTorch TAPIR architecture in
+`tapnet/torch/` and publishes matching PyTorch checkpoints. This avoids porting
+the neural network itself. It does **not** provide an official PyTorch TAPIR
+training framework: the upstream training loop, optimizer integration, losses,
+evaluation, and checkpoint management are JAX/JAXline code. Google DeepMind
+links to a third-party PyTorch training project but explicitly states that it is
+not affiliated and its accuracy has not been verified.
+
+Implemented scope:
+
+1. The framework-independent NumPy generator is reused unchanged.
+2. The PyTorch data adapter does not route through TensorFlow.
+3. The complete first-pass seismic loss and unrefined losses are ported.
+4. The trainer uses the official PyTorch TAPIR module and loads the published
+   BootsTAPIR v2 checkpoint with strict key matching.
+5. Optimizer, schedule, gradient clipping, checkpoint/resume, mixed precision,
+   and peak-memory reporting are implemented.
+6. Deterministic CPU tests and full-model backward tests are implemented.
+7. The `vdi-small` configuration uses batch size one, reduced geometry, and a
+   frozen feature encoder by default when pretrained weights are supplied.
+
+Known omissions and risks:
+
+- no CUDA run has been performed on the target VDI;
+- no PyTorch evaluation command or seismic-metric report exists yet;
+- the short fixed-batch sanity check reduces loss, but near-zero overfit and
+  convergence have not passed;
+- exact parity with the JAX checkpoint/training trajectory is not expected;
+- the current JAX/JAXline configuration cannot be reused directly;
+- peak VRAM on the L40-12Q is unknown; and
+- corporate package-index and checkpoint-download policies may require an
+  offline wheel/checkpoint transfer.
+
+Do not delete the JAX implementation. Keep it as the tested reference until the
+PyTorch CUDA smoke, fixed-batch overfit, evaluation, and held-out tests have all
+passed.
+
+#### Native Windows PyTorch setup
+
+Create the environment without administrator privileges:
+
+```powershell
+python -m venv .venv-torch
+.venv-torch\Scripts\python.exe -m pip install --upgrade pip
+```
+
+Use the official PyTorch selector to install a Windows/Pip/CUDA wheel compatible
+with the VDI. Then install the remaining local requirements and verify CUDA:
+
+```powershell
+.venv-torch\Scripts\python.exe -m pip install -r requirements_seismic_torch_dev.txt
+.venv-torch\Scripts\python.exe -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.version.cuda); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'GPU unavailable')"
+```
+
+Run commands from the repository root. Do not use `pip install -e .` for this
+environment yet: the upstream `pyproject.toml` lists JAX/JAXline as unconditional
+dependencies. `requirements_seismic_torch.txt` intentionally supplies only the
+PyTorch-path runtime packages so the target environment need not install JAX or
+TensorFlow.
+
+Download or copy the official checkpoint to an ignored local directory:
+
+```powershell
+New-Item -ItemType Directory -Force checkpoints\pretrained
+curl.exe -L --fail --output checkpoints\pretrained\bootstapir_checkpoint_v2.pt https://storage.googleapis.com/dm-tapnet/bootstap/bootstapir_checkpoint_v2.pt
+```
+
+If corporate policy blocks the URL, transfer the approved file through the
+organization's permitted mechanism. The locally validated file size was
+218,886,140 bytes; no upstream cryptographic checksum was found, so size alone
+is not an authenticity guarantee.
+
+### Windows with an NVIDIA GPU: WSL2 setup
+
+Observed development host on 2026-10-05:
+
+- GPU: NVIDIA RTX PRO 500 Blackwell Generation Laptop GPU;
+- dedicated VRAM reported by `nvidia-smi`: 6113 MiB;
+- NVIDIA driver: 596.58;
+- maximum CUDA version reported by the driver: 13.2; and
+- WSL was not installed at the time of inspection.
+
+The driver is new enough for the CUDA 13 JAX wheel. The approximately 6 GB of
+VRAM is expected to be the main constraint. The smoke configuration should be
+tested first; the default 24-frame, 256-by-256 configuration is not assumed to
+fit until measured. If it does not fit, create and document a reduced GPU
+configuration instead of silently changing the default experiment.
+
+Assumptions for this path:
+
+- the machine has a supported NVIDIA GPU;
+- Windows 11, or a Windows 10 release that supports WSL2, is installed;
+- virtualization is enabled in the firmware; and
+- the NVIDIA **Windows** driver supports CUDA in WSL.
+
+In an Administrator PowerShell terminal, list the available distributions and
+install Ubuntu 22.04 so the WSL environment uses the Python 3.10 version already
+validated by this prototype:
+
+```powershell
+wsl --update
+wsl --list --online
+wsl --install -d Ubuntu-22.04
+```
+
+Restart Windows if requested. Install or update the NVIDIA Windows driver before
+continuing. Do not install an NVIDIA Linux display driver inside WSL; WSL exposes
+the Windows host driver to Linux. In the Ubuntu terminal, first confirm that the
+GPU is visible:
+
+```bash
+nvidia-smi
+```
+
+Keep the training checkout in the WSL Linux filesystem (for example,
+`~/tap-testing`) rather than under `/mnt/c` to avoid slower filesystem access.
+The seismic changes must first be committed and pushed to an accessible branch,
+or the complete working tree must be copied, because cloning upstream TAPNet
+alone does not contain this prototype.
+
+Inside the WSL checkout, create the environment and install the CUDA-enabled
+JAX wheel before the project requirements:
+
+```bash
+sudo apt update
+sudo apt install -y git python3-venv python3-pip
+
+python3.10 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install --upgrade "jax[cuda13]"
+python -m pip install -r requirements_seismic_dev.txt
+```
+
+If the installed GPU or Windows driver cannot support the CUDA 13 JAX wheel,
+use `jax[cuda12]` instead. Do not install both variants. Verify the environment:
+
+```bash
+python --version
+python -c "import jax; print(jax.__version__); print(jax.devices())"
+python -c "import tensorflow as tf; print(tf.__version__)"
+python -m pytest tests -q
+```
+
+`jax.devices()` must include a GPU before attempting the default experiment.
+This WSL2 GPU path has not yet been executed for this prototype. GPU memory use,
+throughput, suspend/resume behavior, and checkpoint restart remain explicit
+future tests.
+
+### Native Linux or managed Linux GPU container
 
 Create an isolated environment and install the correct accelerator-specific JAX
-build first. One Linux/NVIDIA example is:
+build first. One native Linux/NVIDIA example is:
 
 ```bash
 python -m venv .venv
@@ -143,6 +389,8 @@ Check the active backend before starting a long run:
 python -c "import jax; print(jax.devices())"
 ```
 
+### Native Windows: CPU smoke testing only
+
 On PowerShell, CPU-only smoke setup is:
 
 ```powershell
@@ -156,6 +404,41 @@ Run all tests:
 
 ```bash
 python -m pytest tests -q
+```
+
+Run the native-Windows PyTorch plumbing smoke test. Use `--device cpu` only for
+development; the VDI gate must use `--device cuda`:
+
+```powershell
+python -m tapnet.seismic.train_torch --config smoke --device cuda --checkpoint-every 1
+```
+
+Run exactly one constrained pretrained VDI step before scheduling training:
+
+```powershell
+python -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 1 `
+  --device cuda `
+  --pretrained-checkpoint checkpoints\pretrained\bootstapir_checkpoint_v2.pt `
+  --output-dir checkpoints\seismic_tapir_torch_vdi_cuda_smoke `
+  --checkpoint-every 1
+```
+
+Record the reported `peak_cuda_memory_gib`, elapsed time, losses, gradient norm,
+PyTorch version, CUDA runtime, driver, and GPU name. Do not start the 2,000-step
+run until this command completes with memory headroom.
+
+Run the fixed-batch learning sanity check separately from normal training:
+
+```powershell
+python -m tapnet.seismic.train_torch `
+  --config smoke `
+  --steps 20 `
+  --device cuda `
+  --overfit-one-batch `
+  --output-dir checkpoints\seismic_tapir_torch_overfit `
+  --checkpoint-every 20
 ```
 
 Create a visual sample:
@@ -192,12 +475,12 @@ by Git because even a smoke checkpoint is approximately 373 MB.
 
 ## Validation record
 
-Validated on 2026-10-05:
+Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
-- `python -m pytest tests -q`: **17 passed**.
+- Final combined `python -m pytest tests -q`: **29 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -207,6 +490,36 @@ Validated on 2026-10-05:
   finite loss and gradients, checkpoint saved.
 - Smoke evaluation: two deterministic examples, seismic metrics returned, and
   one-off evaluator exited normally.
+- PyTorch 2.14.1+cpu on Python 3.10.11: all data, loss, configuration, resume
+  sequence, and full-model autograd tests passed.
+- PyTorch/JAX seismic loss values match on fixed randomized tensors within
+  `1e-6` relative and absolute tolerance.
+- The upstream in-place residual addition was reproduced as an autograd failure,
+  changed to an out-of-place equivalent, and verified by the full TAPIR backward
+  test.
+- PyTorch random-weight smoke: one 64-by-64 forward/backward/update step,
+  checkpoint save, and resumed second step completed on CPU.
+- Official `bootstapir_checkpoint_v2.pt`: 218,886,140 bytes, strict state load
+  succeeded with all keys matching the 54,699,335-parameter PyTorch model.
+- Pretrained constrained smoke: one 128-by-128, 8-frame, 16-query update with
+  the feature encoder frozen completed on CPU and saved a checkpoint.
+- That pretrained step reported a pre-clipping gradient norm of 1110.08; the
+  configured global-norm limit of 1.0 was applied. This is a warning to monitor
+  loss scaling and stability on CUDA, not evidence that the chosen learning rate
+  is safe.
+- Checkpoint state restoration and deterministic continuation at the next sample
+  index completed. Exact uninterrupted-versus-resumed numerical parity has not
+  yet been measured.
+- A 20-step fixed-batch CPU sanity run reduced total deeply supervised loss from
+  3.061385 to 1.707801. This demonstrates short-horizon learning but is not the
+  near-zero overfit result required for model promotion.
+- Four generated CPU validation checkpoints totaling 2,164,837,932 bytes were
+  deleted after their save/resume behavior was verified. They are reproducible
+  with the commands above. The 218,886,140-byte official pretrained checkpoint
+  remains under the Git-ignored `checkpoints/pretrained/` directory.
+- A pretrained frozen-encoder checkpoint resumed for a second update with the
+  encoder still frozen and the compatible optimizer state restored. Changing
+  encoder trainability during resume is rejected; it requires a new run.
 
 The smoke evaluation followed a single random-weight update. Its numerical
 accuracy is intentionally not recorded as a benchmark because it provides no
@@ -218,12 +531,12 @@ These omissions are material and must not be inferred as implemented:
 
 1. **No useful model has been trained.** The default 20,000-step configuration
    has not been run on a GPU, tuned, or shown to converge.
-2. **No one-batch overfit test yet.** The current one-step smoke test only proves
-   that execution and gradients work.
-3. **No pretrained checkpoint initialization.** The current config initializes
-   TAPIR randomly. Upstream released checkpoints and JAXline resume checkpoints
-   have different practical roles; compatible parameter-only initialization
-   must be implemented and verified before claiming transfer learning.
+2. **The one-batch overfit gate is incomplete.** A 20-step fixed-batch run
+   reduced loss substantially, but did not approach zero and was not run with
+   pretrained weights or on CUDA.
+3. **Pretrained initialization is only CPU-validated.** The official PyTorch
+   BootsTAPIR checkpoint loads strictly and one frozen-encoder update completed,
+   but CUDA memory use, learning, and generalization are unverified.
 4. **No real-volume reader.** SEG-Y, ZGY, NumPy cube, horizon-grid ingestion,
    survey normalization, inline/crossline metadata, and real-data split logic do
    not exist yet.
@@ -248,9 +561,10 @@ These omissions are material and must not be inferred as implemented:
     high-confidence pseudo-label training are future work.
 11. **No physical-unit metrics.** Errors are in samples and traces, not
     milliseconds, metres, or survey coordinates.
-12. **No distributed training validation.** Only a single CPU device smoke run
-    was performed. GPU memory use, throughput, mixed precision, multi-GPU
-    reduction, and checkpoint restart have not been tested.
+12. **No GPU or distributed training validation.** Single-device CPU updates and
+    checkpoint restoration were performed. GPU memory use, throughput, mixed
+    precision, multi-GPU reduction, and exact numerical restart parity have not
+    been tested.
 13. **No prestack support.** The current input represents one scalar post-stack
     amplitude repeated into three channels.
 14. **No data-volume caching/profile.** Synthetic generation is online and has
@@ -260,8 +574,9 @@ These omissions are material and must not be inferred as implemented:
 
 ### P0: establish that the prototype can learn
 
-1. Add a finite, fixed synthetic training set and overfit one batch until depth
-   error is near zero. Failure blocks all larger experiments.
+1. Extend the fixed-batch mode until depth error is near zero, first with the
+   frozen pretrained model and then, if needed, selected layers unfrozen.
+   Failure blocks all larger experiments.
 2. Run the default tensor shapes for several steps on the target GPU and record
    peak memory, compile time, and examples/second.
 3. Train on a small fixed synthetic train/validation split and plot every loss

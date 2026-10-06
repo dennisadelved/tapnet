@@ -1,0 +1,8 @@
+# Install the approved CUDA-enabled PyTorch wheel for the Windows VDI first.
+# Use https://pytorch.org/get-started/locally/ to select Windows, Pip, and CUDA.
+# This intentionally does not install the project through pyproject.toml because
+# the upstream base dependencies currently include JAX.
+numpy
+einshape
+torch
+

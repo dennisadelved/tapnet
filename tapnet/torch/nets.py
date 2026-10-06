@@ -57,7 +57,7 @@ class ExtraConvBlock(nn.Module):
     x = x.permute(0, 3, 1, 2)
     res = self.conv(x)
     res = F.gelu(res, approximate='tanh')
-    x += self.conv_1(res)
+    x = x + self.conv_1(res)
     x = x.permute(0, 2, 3, 1)
     return x
 
