@@ -110,6 +110,8 @@ DeepMind's official `tapnet.torch.tapir_model.TAPIR` implementation. It includes
 - CUDA automatic mixed precision, disabled automatically on CPU;
 - AdamW with the current learning rate, beta, gradient clipping, weight decay,
   warmup, and cosine-decay intent;
+- optional discriminative feature-encoder learning rate through
+  `--encoder-lr-multiplier`, while retaining the established head schedule;
 - bias parameters excluded from weight decay to approximate the JAX optimizer;
 - optional official PyTorch checkpoint initialization;
 - default feature-encoder freezing when a pretrained checkpoint is supplied;
@@ -793,6 +795,47 @@ cleanup succeeded. This proves that a user/profile/directory quota or storage
 filter, rather than monolithic file size alone, is blocking writes. Sharding
 improves atomicity but cannot bypass the effective quota.
 
+The model-only gate under `%LOCALAPPDATA%` failed while writing the model shard
+at approximately 4.1 MB, again with `Errno 28` and 1858.478 GiB volume-level
+free space. Only the 2,163-byte `metrics.csv` was written. The effective limit
+therefore applies across the user's profile rather than only to `Documents`,
+and neither sharding nor omitting optimizer state can work around it. No useful
+model checkpoint can be preserved until existing user files are removed or the
+VDI quota is increased.
+
+The user-level checkpoint inventory identified approximately 3.65 GiB of
+generated `.pt` artifacts plus the 208.75 MiB official pretrained checkpoint,
+consistent with an approximately 4 GiB effective profile quota. The generated
+artifacts consist of superseded precision smokes, fixed-batch memorization
+checkpoints, unstable trainable-encoder checkpoints, and one invalid 454.45 MiB
+temporary file. None is a useful generalizing model. They are approved cleanup
+targets once their exact paths are previewed. Retain
+`checkpoints/pretrained/bootstapir_checkpoint_v2.pt` and the small CSV logs.
+Deleting the generated `.pt` files is not reversible, but their validation
+results are recorded here and the experiments are reproducible.
+
+After those generated `.pt` artifacts were removed, the full sharded
+trainable-encoder gate successfully saved step 1 on the VDI. It reported finite
+loss `12.852104`, finite pre-clipping gradient norm `5300.103516`, and 1.252 GiB
+peak allocated CUDA memory. The output contains a `latest.pt` manifest plus
+model, optimizer, and training-state shards. Sharded saving is therefore
+VDI-validated; loading and exact optimizer continuation remain gated on the
+step-2 resume test.
+
+The step-2 resume gate then loaded the sharded manifest and all three state
+shards, restored the optimizer and scheduler, appended to the same CSV, and
+saved a replacement checkpoint. Loss decreased from 12.852104 at step 1 to
+12.688643 at step 2, the actual head learning rate advanced from `1e-6` to
+`2e-6`, gradients remained finite, and peak allocated CUDA memory was 1.319 GiB.
+Full sharded save and exact resume are therefore VDI-validated.
+
+The shared `1e-4` peak rate destabilized the earlier trainable-encoder run even
+though that rate was stable with the encoder frozen. The trainer now supports a
+separate encoder multiplier without changing the default. The initial ablation
+uses `--encoder-lr-multiplier 0.1`, giving a `1e-5` encoder peak while retaining
+the `1e-4` head peak. Both rates are recorded in `metrics.csv`; the multiplier
+is checkpointed and cannot change during exact resume.
+
 The older trainer left an invalid `latest.pt.tmp`. Because those saves wrote the
 temporary file before replacing `latest.pt`, a previously completed step-50
 `latest.pt` should remain intact; neither failed attempt persisted its current
@@ -844,6 +887,27 @@ directory:
 Both directories must contain `metrics.csv`, a small `latest.pt`, and one each
 of `.model.pt`, `.optimizer.pt`, and `.training.pt`. The second command must
 start at step 2. Attach the second run's `metrics.csv` for review.
+
+After the save/resume gate passes, run the controlled discriminative-rate
+ablation from the official checkpoint:
+
+```powershell
+$tapnetOutput = 'checkpoints\seismic_tapir_torch_vdi_encoder_lr01_overfit300'
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 300 `
+  --device cuda `
+  --overfit-one-batch `
+  --train-feature-encoder `
+  --encoder-lr-multiplier 0.1 `
+  --pretrained-checkpoint checkpoints\pretrained\bootstapir_checkpoint_v2.pt `
+  --output-dir $tapnetOutput `
+  --checkpoint-every 50
+```
+
+This is a fresh run, not a resume of the unstable shared-rate experiment. The
+head schedule still peaks at `1e-4`; the encoder schedule peaks at `1e-5`.
+Attach only `$tapnetOutput\metrics.csv` after completion or failure.
 
 If the full gate remains blocked after removing obsolete artifacts, test whether
 the quota is specific to `Documents` using a model-only output under local app
@@ -913,7 +977,7 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
-- Final combined `python -m pytest tests -q`: **37 passed**.
+- Final combined `python -m pytest tests -q`: **39 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -997,6 +1061,21 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
   checkpoint was preserved. Full/model-only manifest behavior, parameter-only
   loading, and rejection of model-only exact resume are covered by the final
   37-test suite. The quota/storage-filter cause remains external and unresolved.
+- A model-only save under `%LOCALAPPDATA%` also failed after approximately
+  4.1 MB, while its 2,163-byte CSV succeeded. This establishes an account/profile
+  storage blocker. Training computation can run, but durable model training is
+  blocked until quota is reclaimed or increased.
+- After reclaiming approximately 3.65 GiB of obsolete generated checkpoints, a
+  full sharded step-1 checkpoint saved successfully. Loss and gradients were
+  finite and peak allocated CUDA memory was 1.252 GiB. VDI shard writing is
+  validated; the step-2 load/resume result is still required.
+- The step-2 sharded resume restored model, optimizer, scheduler, and fixed-batch
+  state, appended CSV metrics, and saved a replacement checkpoint. Loss was
+  12.688643, the pre-clipping gradient norm was finite at 7571.959961, and peak
+  allocated CUDA memory was 1.319 GiB. Full VDI save/resume is validated.
+- Discriminative encoder/head learning-rate groups and multiplier validation are
+  covered by tests. The final suite contains 39 passing tests; the `0.1` encoder
+  multiplier has not yet been run on the VDI.
 
 The smoke evaluation followed a single random-weight update. Its numerical
 accuracy is intentionally not recorded as a benchmark because it provides no
@@ -1052,12 +1131,10 @@ These omissions are material and must not be inferred as implemented:
 
 ### P0: establish that the prototype can learn
 
-1. Identify or work around the VDI's effective storage quota. Remove only
-   verified obsolete/partial checkpoints, then test model-only output under
-   `%LOCALAPPDATA%`. After storage works, validate a full sharded save/resume.
-   Then add a lower encoder learning rate or separate encoder/head rates before
-   restarting the trainable-encoder ablation. Do not resume the unstable
-   `1e-4` schedule unchanged or alter stage-0 loss weights.
+1. Start a fresh pretrained fixed-batch run with head rate `1e-4` and encoder
+   multiplier `0.1`. Compare its stage-0 curve and stability against the failed
+   shared-rate run. Do not resume the unstable shared-rate checkpoint or alter
+   stage-0 loss weights.
 2. Run the default tensor shapes for several steps on the target GPU and record
    peak memory, compile time, and examples/second.
 3. Train on a small fixed synthetic train/validation split and plot every loss

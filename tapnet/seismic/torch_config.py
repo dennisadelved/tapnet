@@ -22,6 +22,7 @@ class TorchTrainingConfig:
   warmup_steps: int = 0
   weight_decay: float = 1e-2
   gradient_clip_norm: float = 1.0
+  encoder_learning_rate_multiplier: float = 1.0
   seed: int = 0
   fixed_batch: bool = False
   freeze_feature_encoder: bool = False
@@ -46,6 +47,11 @@ class TorchTrainingConfig:
       )
     if self.amp_dtype not in ('bfloat16', 'float16'):
       raise ValueError('amp_dtype must be bfloat16 or float16.')
+    if not 0.0 < self.encoder_learning_rate_multiplier <= 1.0:
+      raise ValueError(
+          'encoder_learning_rate_multiplier must be greater than 0 and at '
+          'most 1.'
+      )
 
 
 def get_config(variant: str) -> TorchTrainingConfig:

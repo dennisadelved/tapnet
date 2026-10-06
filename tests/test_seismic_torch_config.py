@@ -1,5 +1,7 @@
 """Configuration tests for the PyTorch seismic training path."""
 
+import dataclasses
+
 import pytest
 
 from tapnet.seismic import torch_config
@@ -31,4 +33,13 @@ def test_cuda_precision_defaults_to_bfloat16():
 
   assert config.amp_enabled
   assert config.amp_dtype == 'bfloat16'
+
+
+def test_encoder_learning_rate_multiplier_is_bounded():
+  config = torch_config.get_config('vdi-small')
+
+  with pytest.raises(ValueError, match='encoder_learning_rate_multiplier'):
+    dataclasses.replace(
+        config, encoder_learning_rate_multiplier=0.0
+    ).validate()
 

@@ -59,7 +59,35 @@ def test_metrics_csv_is_self_describing_and_appendable(tmp_path):
   assert 'training_config_json' in rows[0]
   assert 'loss_config_json' in rows[0]
   assert 'checkpoint_mode' in rows[0]
+  assert 'encoder_learning_rate' in rows[0]
   assert 'peak_cuda_memory_gib' in rows[0]
+
+
+def test_optimizer_uses_lower_learning_rate_for_encoder_parameters():
+  class ToyModel(torch.nn.Module):
+
+    def __init__(self):
+      super().__init__()
+      self.resnet_torch = torch.nn.Linear(2, 2)
+      self.extra_convs = torch.nn.Linear(2, 2)
+      self.head = torch.nn.Linear(2, 2)
+
+  groups = train_torch._optimizer_parameter_groups(
+      ToyModel(),
+      weight_decay=0.01,
+      learning_rate=1e-4,
+      encoder_learning_rate_multiplier=0.1,
+  )
+
+  group_settings = {
+      (group['lr'], group['weight_decay']) for group in groups
+  }
+  assert group_settings == {
+      (1e-4, 0.01),
+      (1e-4, 0.0),
+      (1e-5, 0.01),
+      (1e-5, 0.0),
+  }
 
 
 def test_failed_checkpoint_removes_partial_and_preserves_latest(

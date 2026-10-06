@@ -62,6 +62,12 @@ def _parse_args() -> argparse.Namespace:
       action='store_true',
       help='Also update the ResNet/extra-convolution feature encoder.',
   )
+  parser.add_argument(
+      '--encoder-lr-multiplier',
+      type=float,
+      default=None,
+      help='Feature-encoder learning rate relative to the head learning rate.',
+  )
   args = parser.parse_args()
   if args.pretrained_checkpoint and args.resume:
     parser.error('--pretrained-checkpoint and --resume are mutually exclusive.')
@@ -69,6 +75,10 @@ def _parse_args() -> argparse.Namespace:
     parser.error('--steps must be positive.')
   if args.checkpoint_every < 1:
     parser.error('--checkpoint-every must be positive.')
+  if args.encoder_lr_multiplier is not None and not (
+      0.0 < args.encoder_lr_multiplier <= 1.0
+  ):
+    parser.error('--encoder-lr-multiplier must be greater than 0 and at most 1.')
   return args
 
 
@@ -141,23 +151,44 @@ def _freeze_feature_encoder(model: tapir_model.TAPIR) -> None:
 
 
 def _optimizer_parameter_groups(
-    model: torch.nn.Module, weight_decay: float
+    model: torch.nn.Module,
+    weight_decay: float,
+    learning_rate: float,
+    encoder_learning_rate_multiplier: float,
 ) -> list[dict[str, object]]:
-  decay = []
-  no_decay = []
+  grouped_parameters = {
+      ('head', 'decay'): [],
+      ('head', 'no_decay'): [],
+      ('encoder', 'decay'): [],
+      ('encoder', 'no_decay'): [],
+  }
   for name, parameter in model.named_parameters():
     if not parameter.requires_grad:
       continue
-    if name.endswith('.bias'):
-      no_decay.append(parameter)
-    else:
-      decay.append(parameter)
-  if not decay and not no_decay:
+    component = (
+        'encoder'
+        if name.startswith(('resnet_torch.', 'extra_convs.'))
+        else 'head'
+    )
+    decay = 'no_decay' if name.endswith('.bias') else 'decay'
+    grouped_parameters[(component, decay)].append(parameter)
+  if not any(grouped_parameters.values()):
     raise ValueError('No trainable model parameters remain.')
-  return [
-      {'params': decay, 'weight_decay': weight_decay},
-      {'params': no_decay, 'weight_decay': 0.0},
-  ]
+  parameter_groups = []
+  for (component, decay), parameters in grouped_parameters.items():
+    if not parameters:
+      continue
+    rate_multiplier = (
+        encoder_learning_rate_multiplier if component == 'encoder' else 1.0
+    )
+    parameter_groups.append(
+        {
+            'params': parameters,
+            'weight_decay': weight_decay if decay == 'decay' else 0.0,
+            'lr': learning_rate * rate_multiplier,
+        }
+    )
+  return parameter_groups
 
 
 def _lr_multiplier(
@@ -237,6 +268,7 @@ def _metrics_fieldnames(num_stages: int) -> list[str]:
       'elapsed_seconds',
       'step_seconds',
       'learning_rate',
+      'encoder_learning_rate',
       'gradient_norm',
       'peak_cuda_memory_gib',
       'loss',
@@ -294,6 +326,7 @@ def _config_signature(config: torch_config.TorchTrainingConfig) -> dict:
           'freeze_feature_encoder',
           'amp_enabled',
           'amp_dtype',
+          'encoder_learning_rate_multiplier',
       )
   }
 
@@ -438,6 +471,11 @@ def main() -> None:
     config = dataclasses.replace(config, amp_enabled=False)
   if args.amp_dtype is not None:
     config = dataclasses.replace(config, amp_dtype=args.amp_dtype)
+  if args.encoder_lr_multiplier is not None:
+    config = dataclasses.replace(
+        config,
+        encoder_learning_rate_multiplier=args.encoder_lr_multiplier,
+    )
   output_dir = args.output_dir or Path(
       f'checkpoints/seismic_tapir_torch_{args.config}'
   )
@@ -454,14 +492,27 @@ def main() -> None:
       )
     saved_config = resume_state.get('config', {})
     saved_freeze = bool(saved_config.get('freeze_feature_encoder', False))
+    saved_encoder_lr_multiplier = float(
+        saved_config.get('encoder_learning_rate_multiplier', 1.0)
+    )
     if saved_freeze and args.train_feature_encoder:
       raise ValueError(
           'A frozen-encoder checkpoint cannot be resumed with '
           '--train-feature-encoder because its optimizer state excludes those '
           'parameters. Start a new fine-tuning run from model weights instead.'
       )
+    if (
+        args.encoder_lr_multiplier is not None
+        and args.encoder_lr_multiplier != saved_encoder_lr_multiplier
+    ):
+      raise ValueError(
+          'Encoder learning-rate multiplier cannot change during exact resume. '
+          'Start a new run from model parameters instead.'
+      )
     config = dataclasses.replace(
-        config, freeze_feature_encoder=saved_freeze
+        config,
+        freeze_feature_encoder=saved_freeze,
+        encoder_learning_rate_multiplier=saved_encoder_lr_multiplier,
     )
   elif args.pretrained_checkpoint:
     config = dataclasses.replace(
@@ -480,7 +531,9 @@ def main() -> None:
   model = _build_model(config)
   start_step = 0
   if resume_state is not None:
-    if resume_state.get('config_signature') != _config_signature(config):
+    saved_signature = dict(resume_state.get('config_signature', {}))
+    saved_signature.setdefault('encoder_learning_rate_multiplier', 1.0)
+    if saved_signature != _config_signature(config):
       raise ValueError(
           'Resume checkpoint model/data configuration does not match the '
           'requested configuration.'
@@ -500,7 +553,12 @@ def main() -> None:
   model.to(device)
   model.train()
 
-  parameter_groups = _optimizer_parameter_groups(model, config.weight_decay)
+  parameter_groups = _optimizer_parameter_groups(
+      model,
+      config.weight_decay,
+      config.learning_rate,
+      config.encoder_learning_rate_multiplier,
+  )
   optimizer = torch.optim.AdamW(
       parameter_groups,
       lr=config.learning_rate,
@@ -629,6 +687,11 @@ def main() -> None:
         'elapsed_seconds': step_finished_at - training_started_at,
         'step_seconds': step_finished_at - step_started_at,
         'learning_rate': learning_rate,
+        'encoder_learning_rate': (
+            learning_rate * config.encoder_learning_rate_multiplier
+            if feature_encoder_status == 'trainable'
+            else ''
+        ),
         'gradient_norm': float(gradient_norm),
         'peak_cuda_memory_gib': peak_cuda_memory_gib,
         **{
