@@ -119,6 +119,8 @@ DeepMind's official `tapnet.torch.tapir_model.TAPIR` implementation. It includes
 - an explicit `--overfit-one-batch` learning sanity-check mode;
 - aggregate intermediate loss plus per-stage position, occlusion, probability,
   and total loss logging for every deeply supervised unrefined output; and
+- a continuously flushed `metrics.csv` in every output directory, containing
+  metrics plus enough configuration and environment context for handoff; and
 - CUDA peak allocated-memory reporting at process exit.
 
 For `vdi-small`, `stage_0` is the initial cost-volume prediction and
@@ -128,6 +130,16 @@ final model output. `intermediate_loss` is the sum of all four stage totals;
 the optimization objective remains `loss = final losses + intermediate_loss`.
 This is a logging-only change and does not alter checkpoint compatibility or
 loss weighting.
+
+Each CSV row contains a UTC run ID, step and target step count, configuration,
+fixed-batch flag, seed, device and GPU, PyTorch and CUDA versions, precision,
+encoder trainability, source checkpoint, elapsed and step times, learning rate,
+pre-clipping gradient norm, cumulative peak allocated CUDA memory, all final
+losses, aggregate intermediate loss, and all per-stage losses. The file is
+closed after every row, so completed rows survive a later training or checkpoint
+failure. Resumed processes append with a new run ID. Attach `metrics.csv` in
+future updates instead of copying terminal output; the session and checkpoint
+columns preserve the needed context.
 
 The upstream PyTorch inference model used an in-place residual addition in
 `tapnet/torch/nets.py`. It was changed to an equivalent out-of-place addition
@@ -407,6 +419,36 @@ The frozen feature encoder uses `InstanceNorm2d` with
 therefore does not silently change normalization statistics in the frozen
 encoder and does not explain the intermediate-loss plateau.
 
+The per-stage step-301 diagnostic isolated the residual:
+
+```text
+final output total       0.000024
+intermediate total       0.480867
+stage 0 position         0.110461
+stage 0 occlusion        0.000005
+stage 0 probability      0.370307
+stage 0 total            0.480773
+stage 1 total            0.000049
+stage 2 total            0.000023
+stage 3 total            0.000023
+overall loss             0.480891
+pre-clipping gradient    0.622427
+peak allocated CUDA      0.876 GiB
+```
+
+Stage 0 is the initial cost-volume prediction and accounts for 99.98% of the
+intermediate loss. Its expected-distance loss accounts for 77.0% of the stage-0
+residual, position for 23.0%, and occlusion is effectively solved. All three
+mixer refinements and the final output have overfit the fixed batch.
+
+The reference JAX trainer also applies position, occlusion, and probability
+supervision equally to every item in `unrefined_tracks`, including stage 0.
+The residual is therefore not caused by accidental extra supervision in the
+PyTorch port. Do not remove or down-weight stage 0 without an explicit ablation.
+The next controlled test is a fresh fixed-batch run from the official pretrained
+checkpoint with the feature encoder trainable, preceded by a one-step CUDA
+memory and gradient gate.
+
 ### PyTorch alternative for a locked-down Windows VDI
 
 PyTorch is the preferred alternative if the VDI cannot provide WSL2 or a Linux
@@ -669,6 +711,95 @@ probability, and total loss for stages 0 through 3. This diagnostic uses the
 existing optimizer state and approximately `1e-6` learning-rate floor; it is
 not a new training experiment.
 
+The diagnostic showed that only stage 0 remains material. Before a longer
+trainable-encoder overfit run, execute a one-step memory and gradient gate:
+
+```powershell
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 1 `
+  --device cuda `
+  --overfit-one-batch `
+  --train-feature-encoder `
+  --pretrained-checkpoint checkpoints\pretrained\bootstapir_checkpoint_v2.pt `
+  --output-dir checkpoints\seismic_tapir_torch_vdi_trainable_encoder_smoke1 `
+  --checkpoint-every 1
+```
+
+Only if that step has finite loss and gradients and fits in device memory,
+continue the same optimizer state to step 300:
+
+```powershell
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 300 `
+  --device cuda `
+  --overfit-one-batch `
+  --train-feature-encoder `
+  --resume checkpoints\seismic_tapir_torch_vdi_trainable_encoder_smoke1\latest.pt `
+  --output-dir checkpoints\seismic_tapir_torch_vdi_trainable_encoder_overfit300 `
+  --checkpoint-every 50
+```
+
+This must be a new trainable-encoder run. The frozen-encoder step-301 optimizer
+has no state for encoder parameters and is intentionally rejected if resumed
+with `--train-feature-encoder`.
+
+The one-step trainable-encoder gate completed successfully on the L40-12Q:
+
+```text
+loss                       12.852104
+final position              1.043687
+final occlusion             1.469949
+final probability           0.502973
+intermediate loss           9.835494
+pre-clipping gradient    5298.271973
+learning rate used          0.000001
+peak allocated CUDA         1.252 GiB
+checkpoint                  checkpoints/seismic_tapir_torch_vdi_trainable_encoder_smoke1/latest.pt
+```
+
+The update and checkpoint were valid and all reported values were finite. Peak
+allocated memory increased by 0.376 GiB relative to the 0.876 GiB frozen-encoder
+diagnostic and remains far below the 11 GB allocation. The pre-clipping gradient
+is large and was clipped to the configured norm of 1.0. The 300-step continuation
+above is now cleared to run, with gradient finiteness and stage-0 losses as the
+primary monitoring signals.
+
+The trainable-encoder continuation reached step 100 but failed while writing
+the step-100 checkpoint:
+
+```text
+RuntimeError: ios_base::badbit set: iostream stream error
+RuntimeError: unexpected pos 476526592 vs 476526480
+```
+
+This was a storage write failure, not a CUDA out-of-memory or non-finite-gradient
+failure. The older trainer left an invalid `latest.pt.tmp`. Because checkpoint
+saves write the temporary file before replacing `latest.pt`, a successfully
+written step-50 `latest.pt` should remain intact if its earlier save completed;
+step-100 model/optimizer state was not persisted. Confirm rather than assume the
+saved step:
+
+```powershell
+Get-PSDrive -Name C | Select-Object Used, Free
+Get-ChildItem checkpoints\seismic_tapir_torch_vdi_trainable_encoder_overfit300 `
+  -Force | Select-Object Name, Length, LastWriteTime
+.venv-torch\Scripts\python.exe -c "import torch; p=r'checkpoints\seismic_tapir_torch_vdi_trainable_encoder_overfit300\latest.pt'; print(torch.load(p, map_location='cpu', weights_only=True)['step'])"
+```
+
+If `latest.pt` loads and `latest.pt.tmp` exists, the latter is the incomplete
+step-100 artifact and can be removed using its exact path. The trainer now
+removes a partial temporary file after a save error, preserves the preceding
+`latest.pt`, and reports available disk space in its exception. This behavior
+cannot retroactively repair the failed VDI run.
+
+Optimization was also unstable as the shared learning rate reached `1e-4`:
+total loss was 0.503898 at step 76 but rose to 5.181211 at step 100, with a
+pre-clipping gradient norm of 1328.516235. Do not resume the trainable-encoder
+run unchanged after fixing storage. A lower encoder learning rate or separate
+encoder/head parameter-group rates must be tested first.
+
 Create a visual sample:
 
 ```bash
@@ -708,7 +839,7 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
-- Final combined `python -m pytest tests -q`: **33 passed**.
+- Final combined `python -m pytest tests -q`: **35 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -770,6 +901,21 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
   position, occlusion, probability, and total loss for each unrefined stage.
   Tests verify exact loss accounting and the console format. This logging-only
   revision passed the full 33-test suite and retains checkpoint compatibility.
+- The step-301 diagnostic attributed 0.480773 of 0.480867 intermediate loss to
+  stage 0 (99.98%). Stage-0 probability loss was 0.370307, position loss was
+  0.110461, and occlusion loss was 0.000005. Stages 1 through 3 and the final
+  output were all effectively zero. The checkpoint saved successfully and peak
+  allocated CUDA memory remained 0.876 GiB.
+- A fresh trainable-encoder BF16 update from the official checkpoint completed
+  with finite loss and a finite pre-clipping gradient norm of 5298.271973. The
+  norm was clipped to 1.0, the checkpoint saved successfully, and peak allocated
+  CUDA memory was 1.252 GiB. This passes the execution/memory gate but is not
+  evidence of stable full-encoder optimization beyond one step.
+- The trainable-encoder continuation remained finite through step 100, but loss
+  rose to 5.181211 as the learning rate reached `1e-4`, and the step-100
+  checkpoint failed with an iostream write error. The run is not a successful
+  overfit result. CSV append/flush behavior and checkpoint-failure cleanup are
+  now regression-tested; the full suite contains 35 passing tests.
 
 The smoke evaluation followed a single random-weight update. Its numerical
 accuracy is intentionally not recorded as a benchmark because it provides no
@@ -783,9 +929,9 @@ These omissions are material and must not be inferred as implemented:
    has not been run on a GPU, tuned, or shown to converge.
 2. **The complete one-batch overfit gate is partially passed.** On CUDA BF16,
    the pretrained frozen-encoder model drives the final-head losses near zero,
-   but the sum over intermediate refinement outputs remains approximately
-   `0.480581` at step 300. Per-stage and per-loss-term logging is required before
-   deciding whether to change supervision, trainability, or optimization.
+   and stages 1 through 3 also reach near-zero loss. Stage 0 alone retains
+   `0.480773`, primarily expected-distance loss. A trainable-encoder overfit
+   ablation is required before changing supervision or loss weights.
 3. **Pretrained CUDA optimization is validated, not generalization.** The
    official PyTorch BootsTAPIR checkpoint loads strictly and completed 100
    frozen-encoder BF16 updates. No held-out PyTorch evaluation has been run.
@@ -825,11 +971,10 @@ These omissions are material and must not be inferred as implemented:
 
 ### P0: establish that the prototype can learn
 
-1. Print per-stage position, occlusion, and probability losses, then perform one
-   diagnostic forward/update from the step-300 checkpoint. The final output is
-   already near zero; identify the exact intermediate term responsible for the
-   approximately 0.480581 residual before changing the model or running a
-   longer schedule.
+1. Resolve the VDI storage/quota failure and verify the last valid checkpoint.
+   Then add and test a lower encoder learning rate or separate encoder/head
+   rates before restarting the trainable-encoder fixed-batch ablation. Do not
+   resume the unstable `1e-4` schedule unchanged or alter stage-0 loss weights.
 2. Run the default tensor shapes for several steps on the target GPU and record
    peak memory, compile time, and examples/second.
 3. Train on a small fixed synthetic train/validation split and plot every loss

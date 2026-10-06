@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import csv
 import dataclasses
+import datetime
+import json
 import math
 from pathlib import Path
 import random
+import shutil
+import time
 from typing import Mapping
 
 import numpy as np
@@ -176,6 +181,72 @@ def _format_intermediate_scalars(
   return ' '.join(fields)
 
 
+def _metrics_fieldnames(num_stages: int) -> list[str]:
+  """Returns the stable, self-contained training CSV schema."""
+  fields = [
+      'run_id',
+      'step',
+      'total_steps',
+      'config',
+      'fixed_batch',
+      'seed',
+      'device',
+      'gpu',
+      'torch_version',
+      'cuda_version',
+      'precision',
+      'feature_encoder',
+      'source_checkpoint',
+      'output_dir',
+      'checkpoint_every',
+      'training_config_json',
+      'loss_config_json',
+      'elapsed_seconds',
+      'step_seconds',
+      'learning_rate',
+      'gradient_norm',
+      'peak_cuda_memory_gib',
+      'loss',
+      'position_loss',
+      'occlusion_loss',
+      'probability_loss',
+      'intermediate_loss',
+  ]
+  for index in range(num_stages):
+    fields.extend(
+        (
+            f'stage_{index}_position',
+            f'stage_{index}_occlusion',
+            f'stage_{index}_probability',
+            f'stage_{index}_total',
+        )
+    )
+  return fields
+
+
+def _prepare_metrics_csv(path: Path, fieldnames: list[str]) -> None:
+  """Creates a CSV header or validates an existing append target."""
+  path.parent.mkdir(parents=True, exist_ok=True)
+  if path.is_file() and path.stat().st_size:
+    with path.open('r', newline='', encoding='utf-8') as handle:
+      existing_header = next(csv.reader(handle), None)
+    if existing_header != fieldnames:
+      raise ValueError(
+          f'Existing metrics schema does not match this trainer: {path}'
+      )
+    return
+  with path.open('w', newline='', encoding='utf-8') as handle:
+    csv.DictWriter(handle, fieldnames=fieldnames).writeheader()
+
+
+def _append_metrics_csv(
+    path: Path, fieldnames: list[str], row: Mapping[str, object]
+) -> None:
+  """Appends and flushes one training step by closing the file immediately."""
+  with path.open('a', newline='', encoding='utf-8') as handle:
+    csv.DictWriter(handle, fieldnames=fieldnames).writerow(row)
+
+
 def _config_signature(config: torch_config.TorchTrainingConfig) -> dict:
   serialized = dataclasses.asdict(config)
   return {
@@ -207,18 +278,31 @@ def _save_checkpoint(
   output_dir.mkdir(parents=True, exist_ok=True)
   destination = output_dir / 'latest.pt'
   temporary = output_dir / 'latest.pt.tmp'
-  torch.save(
-      {
-          'step': step,
-          'config': dataclasses.asdict(config),
-          'config_signature': _config_signature(config),
-          'model': model.state_dict(),
-          'optimizer': optimizer.state_dict(),
-          'scheduler': scheduler.state_dict(),
-          'scaler': scaler.state_dict(),
-      },
-      temporary,
-  )
+  try:
+    torch.save(
+        {
+            'step': step,
+            'config': dataclasses.asdict(config),
+            'config_signature': _config_signature(config),
+            'model': model.state_dict(),
+            'optimizer': optimizer.state_dict(),
+            'scheduler': scheduler.state_dict(),
+            'scaler': scaler.state_dict(),
+        },
+        temporary,
+    )
+  except Exception as error:
+    try:
+      temporary.unlink(missing_ok=True)
+      temporary_status = 'partial temporary file removed'
+    except OSError as cleanup_error:
+      temporary_status = f'could not remove temporary file: {cleanup_error}'
+    free_gib = shutil.disk_usage(output_dir).free / 1024**3
+    raise RuntimeError(
+        f'Checkpoint save failed at step {step}; {free_gib:.3f} GiB free in '
+        f'{output_dir}; {temporary_status}. Any previous latest.pt was '
+        'preserved.'
+    ) from error
   temporary.replace(destination)
   return destination
 
@@ -261,8 +345,10 @@ def main() -> None:
   _set_seed(config.seed)
 
   print(f'device={device}')
+  gpu_name = ''
   if device.type == 'cuda':
-    print(f'gpu={torch.cuda.get_device_name(device)}')
+    gpu_name = torch.cuda.get_device_name(device)
+    print(f'gpu={gpu_name}')
     torch.cuda.reset_peak_memory_stats(device)
 
   model = _build_model(config)
@@ -281,9 +367,10 @@ def main() -> None:
 
   if config.freeze_feature_encoder:
     _freeze_feature_encoder(model)
-    print('feature_encoder=frozen')
+    feature_encoder_status = 'frozen'
   else:
-    print('feature_encoder=trainable')
+    feature_encoder_status = 'trainable'
+  print(f'feature_encoder={feature_encoder_status}')
   model.to(device)
   model.train()
 
@@ -326,9 +413,19 @@ def main() -> None:
       _move_batch(next(stream), device) if config.fixed_batch else None
   )
   loss_config = torch_losses.SeismicLossConfig()
+  metrics_path = output_dir / 'metrics.csv'
+  metric_fieldnames = _metrics_fieldnames(config.num_pips_iter)
+  _prepare_metrics_csv(metrics_path, metric_fieldnames)
+  print(f'metrics_csv={metrics_path}')
+  run_id = datetime.datetime.now(datetime.timezone.utc).strftime(
+      '%Y%m%dT%H%M%S.%fZ'
+  )
+  source_checkpoint = str(args.resume or args.pretrained_checkpoint or '')
+  training_started_at = time.perf_counter()
 
   last_checkpoint_step = start_step
   for step in range(start_step, config.steps):
+    step_started_at = time.perf_counter()
     batch = (
         fixed_batch
         if fixed_batch is not None
@@ -372,6 +469,63 @@ def main() -> None:
         f'{name}={float(scalars[name].detach()):.6f}'
         for name in summary_names
     )
+    step_finished_at = time.perf_counter()
+    peak_cuda_memory_gib = (
+        torch.cuda.max_memory_allocated(device) / 1024**3
+        if device.type == 'cuda'
+        else ''
+    )
+    metric_row = {
+        'run_id': run_id,
+        'step': completed_step,
+        'total_steps': config.steps,
+        'config': args.config,
+        'fixed_batch': config.fixed_batch,
+        'seed': config.seed,
+        'device': str(device),
+        'gpu': gpu_name,
+        'torch_version': str(torch.__version__),
+        'cuda_version': torch.version.cuda or '',
+        'precision': precision,
+        'feature_encoder': feature_encoder_status,
+        'source_checkpoint': source_checkpoint,
+        'output_dir': str(output_dir),
+        'checkpoint_every': args.checkpoint_every,
+        'training_config_json': json.dumps(
+            dataclasses.asdict(config), sort_keys=True, separators=(',', ':')
+        ),
+        'loss_config_json': json.dumps(
+            dataclasses.asdict(loss_config),
+            sort_keys=True,
+            separators=(',', ':'),
+        ),
+        'elapsed_seconds': step_finished_at - training_started_at,
+        'step_seconds': step_finished_at - step_started_at,
+        'learning_rate': learning_rate,
+        'gradient_norm': float(gradient_norm),
+        'peak_cuda_memory_gib': peak_cuda_memory_gib,
+        **{
+            name: float(scalars[name].detach()) for name in summary_names
+        },
+    }
+    for index in range(config.num_pips_iter):
+      metric_row.update(
+          {
+              f'stage_{index}_position': float(
+                  scalars[f'position_loss_{index}'].detach()
+              ),
+              f'stage_{index}_occlusion': float(
+                  scalars[f'occlusion_loss_{index}'].detach()
+              ),
+              f'stage_{index}_probability': float(
+                  scalars[f'probability_loss_{index}'].detach()
+              ),
+              f'stage_{index}_total': float(
+                  scalars[f'loss_{index}'].detach()
+              ),
+          }
+      )
+    _append_metrics_csv(metrics_path, metric_fieldnames, metric_row)
     print(
         f'step={completed_step}/{config.steps} {scalar_text} '
         f'gradient_norm={float(gradient_norm):.6f} '
