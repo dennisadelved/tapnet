@@ -14,6 +14,7 @@ import random
 import shutil
 import time
 from typing import Mapping
+import uuid
 
 import numpy as np
 import torch
@@ -84,7 +85,28 @@ def _set_seed(seed: int) -> None:
 def _load_torch_file(path: Path, device: torch.device):
   if not path.is_file():
     raise FileNotFoundError(path)
-  return torch.load(path, map_location=device, weights_only=True)
+  payload = torch.load(path, map_location=device, weights_only=True)
+  if not isinstance(payload, dict) or payload.get('checkpoint_format') != (
+      'sharded_v1'
+  ):
+    return payload
+  shards = payload['shards']
+  training = torch.load(
+      _checkpoint_shard_path(path.parent, shards['training']),
+      map_location=device,
+      weights_only=True,
+  )
+  training['model'] = torch.load(
+      _checkpoint_shard_path(path.parent, shards['model']),
+      map_location=device,
+      weights_only=True,
+  )
+  training['optimizer'] = torch.load(
+      _checkpoint_shard_path(path.parent, shards['optimizer']),
+      map_location=device,
+      weights_only=True,
+  )
+  return training
 
 
 def _build_model(
@@ -265,6 +287,35 @@ def _config_signature(config: torch_config.TorchTrainingConfig) -> dict:
   }
 
 
+def _checkpoint_shard_path(directory: Path, filename: str) -> Path:
+  """Resolves a generated checkpoint shard without allowing path traversal."""
+  relative = Path(filename)
+  if relative.name != filename or not filename.startswith('checkpoint_step'):
+    raise ValueError(f'Invalid checkpoint shard name: {filename!r}')
+  return directory / relative
+
+
+def _read_sharded_manifest(path: Path) -> dict | None:
+  """Reads a small local manifest without loading a legacy checkpoint."""
+  if not path.is_file() or path.stat().st_size > 1024**2:
+    return None
+  try:
+    payload = torch.load(path, map_location='cpu', weights_only=True)
+  except Exception:
+    return None
+  if isinstance(payload, dict) and payload.get('checkpoint_format') == (
+      'sharded_v1'
+  ):
+    return payload
+  return None
+
+
+def _save_torch_payload(payload: object, path: Path) -> None:
+  """Owns the file handle so Windows releases it after serialization errors."""
+  with path.open('wb') as handle:
+    torch.save(payload, handle)
+
+
 def _save_checkpoint(
     output_dir: Path,
     *,
@@ -277,33 +328,81 @@ def _save_checkpoint(
 ) -> Path:
   output_dir.mkdir(parents=True, exist_ok=True)
   destination = output_dir / 'latest.pt'
-  temporary = output_dir / 'latest.pt.tmp'
+  previous_manifest = _read_sharded_manifest(destination)
+  token = uuid.uuid4().hex
+  prefix = f'checkpoint_step{step:08d}_{token}'
+  shard_names = {
+      'model': f'{prefix}.model.pt',
+      'optimizer': f'{prefix}.optimizer.pt',
+      'training': f'{prefix}.training.pt',
+  }
+  shard_payloads = {
+      'model': model.state_dict(),
+      'optimizer': optimizer.state_dict(),
+      'training': {
+          'step': step,
+          'config': dataclasses.asdict(config),
+          'config_signature': _config_signature(config),
+          'scheduler': scheduler.state_dict(),
+          'scaler': scaler.state_dict(),
+      },
+  }
+  final_shards = {
+      key: _checkpoint_shard_path(output_dir, name)
+      for key, name in shard_names.items()
+  }
+  temporary_shards = {
+      key: path.with_suffix(path.suffix + '.tmp')
+      for key, path in final_shards.items()
+  }
+  manifest_temporary = output_dir / f'latest_{token}.pt.tmp'
+  created_paths = []
   try:
-    torch.save(
+    for key in ('model', 'optimizer', 'training'):
+      _save_torch_payload(shard_payloads[key], temporary_shards[key])
+      temporary_shards[key].replace(final_shards[key])
+      created_paths.append(final_shards[key])
+    _save_torch_payload(
         {
+            'checkpoint_format': 'sharded_v1',
             'step': step,
-            'config': dataclasses.asdict(config),
-            'config_signature': _config_signature(config),
-            'model': model.state_dict(),
-            'optimizer': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict(),
-            'scaler': scaler.state_dict(),
+            'shards': shard_names,
         },
-        temporary,
+        manifest_temporary,
     )
+    manifest_temporary.replace(destination)
   except Exception as error:
-    try:
-      temporary.unlink(missing_ok=True)
-      temporary_status = 'partial temporary file removed'
-    except OSError as cleanup_error:
-      temporary_status = f'could not remove temporary file: {cleanup_error}'
+    cleanup_failures = []
+    cleanup_targets = (
+        list(temporary_shards.values())
+        + created_paths
+        + [manifest_temporary]
+    )
+    for path in cleanup_targets:
+      try:
+        path.unlink(missing_ok=True)
+      except OSError as cleanup_error:
+        cleanup_failures.append(f'{path.name}: {cleanup_error}')
+    cleanup_status = (
+        'partial new checkpoint files removed'
+        if not cleanup_failures
+        else 'cleanup failures: ' + '; '.join(cleanup_failures)
+    )
     free_gib = shutil.disk_usage(output_dir).free / 1024**3
     raise RuntimeError(
-        f'Checkpoint save failed at step {step}; {free_gib:.3f} GiB free in '
-        f'{output_dir}; {temporary_status}. Any previous latest.pt was '
+        f'Sharded checkpoint save failed at step {step}; {free_gib:.3f} GiB '
+        f'free in {output_dir}; {cleanup_status}. Any previous latest.pt was '
         'preserved.'
     ) from error
-  temporary.replace(destination)
+
+  if previous_manifest is not None:
+    for filename in previous_manifest['shards'].values():
+      previous_path = _checkpoint_shard_path(output_dir, filename)
+      if previous_path not in final_shards.values():
+        try:
+          previous_path.unlink(missing_ok=True)
+        except OSError:
+          pass
   return destination
 
 

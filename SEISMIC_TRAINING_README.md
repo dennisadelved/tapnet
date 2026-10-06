@@ -113,8 +113,8 @@ DeepMind's official `tapnet.torch.tapir_model.TAPIR` implementation. It includes
 - bias parameters excluded from weight decay to approximate the JAX optimizer;
 - optional official PyTorch checkpoint initialization;
 - default feature-encoder freezing when a pretrained checkpoint is supplied;
-- atomic `latest.pt` checkpoints containing model, optimizer, scheduler,
-  gradient-scaler, step, and configuration state;
+- atomic sharded checkpoints: a small `latest.pt` manifest is replaced only
+  after separate model, optimizer, and training-state files are complete;
 - exact synthetic-stream continuation on resume;
 - an explicit `--overfit-one-batch` learning sanity-check mode;
 - aggregate intermediate loss plus per-stage position, occlusion, probability,
@@ -766,20 +766,24 @@ is large and was clipped to the configured norm of 1.0. The 300-step continuatio
 above is now cleared to run, with gradient finiteness and stage-0 losses as the
 primary monitoring signals.
 
-The trainable-encoder continuation reached step 100 but failed while writing
-the step-100 checkpoint:
+The trainable-encoder continuation first reached step 100 but failed while
+writing the monolithic step-100 checkpoint:
 
 ```text
 RuntimeError: ios_base::badbit set: iostream stream error
 RuntimeError: unexpected pos 476526592 vs 476526480
 ```
 
-This was a storage write failure, not a CUDA out-of-memory or non-finite-gradient
-failure. The older trainer left an invalid `latest.pt.tmp`. Because checkpoint
-saves write the temporary file before replacing `latest.pt`, a successfully
-written step-50 `latest.pt` should remain intact if its earlier save completed;
-step-100 model/optimizer state was not persisted. Confirm rather than assume the
-saved step:
+The retry with enhanced error reporting failed at the same byte offset while
+writing step 50, despite reporting 1858.483 GiB free. This rules out ordinary
+volume free-space exhaustion but not a user/profile quota, filesystem filter,
+antivirus/security product, or a failure specific to PyTorch's monolithic ZIP
+writer. It was not a CUDA out-of-memory or non-finite-gradient failure.
+
+The older trainer left an invalid `latest.pt.tmp`. Because those saves wrote the
+temporary file before replacing `latest.pt`, a previously completed step-50
+`latest.pt` should remain intact; neither failed attempt persisted its current
+state. Confirm rather than assume the saved step:
 
 ```powershell
 Get-PSDrive -Name C | Select-Object Used, Free
@@ -789,10 +793,44 @@ Get-ChildItem checkpoints\seismic_tapir_torch_vdi_trainable_encoder_overfit300 `
 ```
 
 If `latest.pt` loads and `latest.pt.tmp` exists, the latter is the incomplete
-step-100 artifact and can be removed using its exact path. The trainer now
-removes a partial temporary file after a save error, preserves the preceding
-`latest.pt`, and reports available disk space in its exception. This behavior
-cannot retroactively repair the failed VDI run.
+monolithic artifact and can be removed using its exact path after the Python
+process exits. The trainer now avoids this large monolithic write: it writes
+model, optimizer, and training metadata to separate, uniquely named shards,
+then atomically replaces the small `latest.pt` manifest. Existing monolithic
+checkpoints remain readable. If any shard fails, new partial files are removed
+and the previous manifest/checkpoint is preserved. After a successful save,
+shards belonging to the preceding manifest are removed to retain latest-only
+semantics. The sharded format is unit-tested but still requires one VDI save and
+resume gate.
+
+After synchronizing the sharded-checkpoint revision, validate it in a new output
+directory:
+
+```powershell
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 1 `
+  --device cuda `
+  --overfit-one-batch `
+  --train-feature-encoder `
+  --pretrained-checkpoint checkpoints\pretrained\bootstapir_checkpoint_v2.pt `
+  --output-dir checkpoints\seismic_tapir_torch_vdi_sharded_smoke1 `
+  --checkpoint-every 1
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 2 `
+  --device cuda `
+  --overfit-one-batch `
+  --train-feature-encoder `
+  --resume checkpoints\seismic_tapir_torch_vdi_sharded_smoke1\latest.pt `
+  --output-dir checkpoints\seismic_tapir_torch_vdi_sharded_resume2 `
+  --checkpoint-every 1
+```
+
+Both directories must contain `metrics.csv`, a small `latest.pt`, and one each
+of `.model.pt`, `.optimizer.pt`, and `.training.pt`. The second command must
+start at step 2. Attach the second run's `metrics.csv` for review.
 
 Optimization was also unstable as the shared learning rate reached `1e-4`:
 total loss was 0.503898 at step 76 but rose to 5.181211 at step 100, with a
@@ -839,7 +877,7 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
-- Final combined `python -m pytest tests -q`: **35 passed**.
+- Final combined `python -m pytest tests -q`: **36 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -914,8 +952,10 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - The trainable-encoder continuation remained finite through step 100, but loss
   rose to 5.181211 as the learning rate reached `1e-4`, and the step-100
   checkpoint failed with an iostream write error. The run is not a successful
-  overfit result. CSV append/flush behavior and checkpoint-failure cleanup are
-  now regression-tested; the full suite contains 35 passing tests.
+  overfit result. A retry failed at the same byte offset at step 50 despite
+  1858.483 GiB reported free. CSV append/flush and atomic sharded checkpoint
+  save/load/replacement/failure behavior are now regression-tested; the full
+  suite contains 36 passing tests. The sharded format is not yet VDI-validated.
 
 The smoke evaluation followed a single random-weight update. Its numerical
 accuracy is intentionally not recorded as a benchmark because it provides no
@@ -971,9 +1011,10 @@ These omissions are material and must not be inferred as implemented:
 
 ### P0: establish that the prototype can learn
 
-1. Resolve the VDI storage/quota failure and verify the last valid checkpoint.
-   Then add and test a lower encoder learning rate or separate encoder/head
-   rates before restarting the trainable-encoder fixed-batch ablation. Do not
+1. Synchronize the sharded-checkpoint revision and perform a one-step VDI
+   save/resume gate. Verify the three shard files, small `latest.pt` manifest,
+   and `metrics.csv`. Then add and test a lower encoder learning rate or separate
+   encoder/head rates before restarting the trainable-encoder ablation. Do not
    resume the unstable `1e-4` schedule unchanged or alter stage-0 loss weights.
 2. Run the default tensor shapes for several steps on the target GPU and record
    peak memory, compile time, and examples/second.

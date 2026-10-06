@@ -70,9 +70,7 @@ def test_failed_checkpoint_removes_partial_and_preserves_latest(
   scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
   scaler = torch.amp.GradScaler('cuda', enabled=False)
   latest = tmp_path / 'latest.pt'
-  temporary = tmp_path / 'latest.pt.tmp'
   latest.write_bytes(b'valid previous checkpoint')
-  temporary.write_bytes(b'invalid partial checkpoint')
 
   def fail_save(*_args, **_kwargs):
     raise RuntimeError('simulated write failure')
@@ -91,5 +89,48 @@ def test_failed_checkpoint_removes_partial_and_preserves_latest(
     )
 
   assert latest.read_bytes() == b'valid previous checkpoint'
-  assert not temporary.exists()
+  assert not list(tmp_path.glob('checkpoint_step*.tmp'))
+
+
+def test_sharded_checkpoint_round_trip_and_replaces_previous_shards(tmp_path):
+  config = torch_config.get_config('smoke')
+  model = torch.nn.Linear(1, 1)
+  optimizer = torch.optim.AdamW(model.parameters())
+  model(torch.ones((1, 1))).sum().backward()
+  optimizer.step()
+  scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+  scaler = torch.amp.GradScaler('cuda', enabled=False)
+
+  latest = train_torch._save_checkpoint(
+      tmp_path,
+      step=1,
+      config=config,
+      model=model,
+      optimizer=optimizer,
+      scheduler=scheduler,
+      scaler=scaler,
+  )
+  first_manifest = torch.load(latest, weights_only=True)
+  restored = train_torch._load_torch_file(latest, torch.device('cpu'))
+
+  assert first_manifest['checkpoint_format'] == 'sharded_v1'
+  assert restored['step'] == 1
+  assert restored['model'].keys() == model.state_dict().keys()
+  assert restored['optimizer']['state']
+
+  train_torch._save_checkpoint(
+      tmp_path,
+      step=2,
+      config=config,
+      model=model,
+      optimizer=optimizer,
+      scheduler=scheduler,
+      scaler=scaler,
+  )
+  second_manifest = torch.load(latest, weights_only=True)
+
+  assert second_manifest['step'] == 2
+  assert second_manifest['shards'] != first_manifest['shards']
+  for filename in first_manifest['shards'].values():
+    assert not (tmp_path / filename).exists()
 
