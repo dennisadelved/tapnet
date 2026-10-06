@@ -115,6 +115,7 @@ DeepMind's official `tapnet.torch.tapir_model.TAPIR` implementation. It includes
 - default feature-encoder freezing when a pretrained checkpoint is supplied;
 - atomic sharded checkpoints: a small `latest.pt` manifest is replaced only
   after separate model, optimizer, and training-state files are complete;
+- optional `--checkpoint-mode model-only` output for constrained storage;
 - exact synthetic-stream continuation on resume;
 - an explicit `--overfit-one-batch` learning sanity-check mode;
 - aggregate intermediate loss plus per-stage position, occlusion, probability,
@@ -140,6 +141,12 @@ closed after every row, so completed rows survive a later training or checkpoint
 failure. Resumed processes append with a new run ID. Attach `metrics.csv` in
 future updates instead of copying terminal output; the session and checkpoint
 columns preserve the needed context.
+
+Full checkpoints remain the default and are exact-resume artifacts. Model-only
+checkpoints omit AdamW state and are substantially smaller. They cannot be used
+with `--resume`; pass them with `--pretrained-checkpoint` to load parameters and
+start a new optimizer. The selected mode is recorded in both the manifest and
+CSV. This is an explicit storage tradeoff, not an equivalent resume mechanism.
 
 The upstream PyTorch inference model used an in-place residual addition in
 `tapnet/torch/nets.py`. It was changed to an equivalent out-of-place addition
@@ -780,6 +787,12 @@ volume free-space exhaustion but not a user/profile quota, filesystem filter,
 antivirus/security product, or a failure specific to PyTorch's monolithic ZIP
 writer. It was not a CUDA out-of-memory or non-finite-gradient failure.
 
+A subsequent sharded save also failed with `OSError: [Errno 28] No space left
+on device`, while the volume API still reported 1858.479 GiB free. The sharded
+cleanup succeeded. This proves that a user/profile/directory quota or storage
+filter, rather than monolithic file size alone, is blocking writes. Sharding
+improves atomicity but cannot bypass the effective quota.
+
 The older trainer left an invalid `latest.pt.tmp`. Because those saves wrote the
 temporary file before replacing `latest.pt`, a previously completed step-50
 `latest.pt` should remain intact; neither failed attempt persisted its current
@@ -800,8 +813,8 @@ then atomically replaces the small `latest.pt` manifest. Existing monolithic
 checkpoints remain readable. If any shard fails, new partial files are removed
 and the previous manifest/checkpoint is preserved. After a successful save,
 shards belonging to the preceding manifest are removed to retain latest-only
-semantics. The sharded format is unit-tested but still requires one VDI save and
-resume gate.
+semantics. Full and model-only sharded formats are unit-tested, but neither has
+completed a VDI save while the effective quota is exhausted.
 
 After synchronizing the sharded-checkpoint revision, validate it in a new output
 directory:
@@ -831,6 +844,29 @@ directory:
 Both directories must contain `metrics.csv`, a small `latest.pt`, and one each
 of `.model.pt`, `.optimizer.pt`, and `.training.pt`. The second command must
 start at step 2. Attach the second run's `metrics.csv` for review.
+
+If the full gate remains blocked after removing obsolete artifacts, test whether
+the quota is specific to `Documents` using a model-only output under local app
+data:
+
+```powershell
+$tapnetOutput = Join-Path $env:LOCALAPPDATA 'tapnet-checkpoints\model-only-smoke1'
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 1 `
+  --device cuda `
+  --overfit-one-batch `
+  --train-feature-encoder `
+  --checkpoint-mode model-only `
+  --pretrained-checkpoint checkpoints\pretrained\bootstapir_checkpoint_v2.pt `
+  --output-dir $tapnetOutput `
+  --checkpoint-every 1
+```
+
+This command intentionally includes the official pretrained checkpoint. The
+failed command ending in `_new` omitted both `--pretrained-checkpoint` and
+`--resume`, so it started from random weights and is not evidence for the
+planned pretrained encoder ablation.
 
 Optimization was also unstable as the shared learning rate reached `1e-4`:
 total loss was 0.503898 at step 76 but rose to 5.181211 at step 100, with a
@@ -877,7 +913,7 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
-- Final combined `python -m pytest tests -q`: **36 passed**.
+- Final combined `python -m pytest tests -q`: **37 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -956,6 +992,11 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
   1858.483 GiB reported free. CSV append/flush and atomic sharded checkpoint
   save/load/replacement/failure behavior are now regression-tested; the full
   suite contains 36 passing tests. The sharded format is not yet VDI-validated.
+- A sharded VDI retry failed with explicit `Errno 28` despite 1858.479 GiB
+  volume-level free space. Partial new shards were removed and the preceding
+  checkpoint was preserved. Full/model-only manifest behavior, parameter-only
+  loading, and rejection of model-only exact resume are covered by the final
+  37-test suite. The quota/storage-filter cause remains external and unresolved.
 
 The smoke evaluation followed a single random-weight update. Its numerical
 accuracy is intentionally not recorded as a benchmark because it provides no
@@ -1011,11 +1052,12 @@ These omissions are material and must not be inferred as implemented:
 
 ### P0: establish that the prototype can learn
 
-1. Synchronize the sharded-checkpoint revision and perform a one-step VDI
-   save/resume gate. Verify the three shard files, small `latest.pt` manifest,
-   and `metrics.csv`. Then add and test a lower encoder learning rate or separate
-   encoder/head rates before restarting the trainable-encoder ablation. Do not
-   resume the unstable `1e-4` schedule unchanged or alter stage-0 loss weights.
+1. Identify or work around the VDI's effective storage quota. Remove only
+   verified obsolete/partial checkpoints, then test model-only output under
+   `%LOCALAPPDATA%`. After storage works, validate a full sharded save/resume.
+   Then add a lower encoder learning rate or separate encoder/head rates before
+   restarting the trainable-encoder ablation. Do not resume the unstable
+   `1e-4` schedule unchanged or alter stage-0 loss weights.
 2. Run the default tensor shapes for several steps on the target GPU and record
    peak memory, compile time, and examples/second.
 3. Train on a small fixed synthetic train/validation split and plot every loss

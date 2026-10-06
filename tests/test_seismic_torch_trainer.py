@@ -58,6 +58,7 @@ def test_metrics_csv_is_self_describing_and_appendable(tmp_path):
   assert 'source_checkpoint' in rows[0]
   assert 'training_config_json' in rows[0]
   assert 'loss_config_json' in rows[0]
+  assert 'checkpoint_mode' in rows[0]
   assert 'peak_cuda_memory_gib' in rows[0]
 
 
@@ -133,4 +134,30 @@ def test_sharded_checkpoint_round_trip_and_replaces_previous_shards(tmp_path):
   assert second_manifest['shards'] != first_manifest['shards']
   for filename in first_manifest['shards'].values():
     assert not (tmp_path / filename).exists()
+
+
+def test_model_only_checkpoint_omits_optimizer_and_loads_parameters(tmp_path):
+  config = torch_config.get_config('smoke')
+  model = torch.nn.Linear(1, 1)
+  optimizer = torch.optim.AdamW(model.parameters())
+  scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda _: 1.0)
+  scaler = torch.amp.GradScaler('cuda', enabled=False)
+
+  latest = train_torch._save_checkpoint(
+      tmp_path,
+      step=1,
+      config=config,
+      model=model,
+      optimizer=optimizer,
+      scheduler=scheduler,
+      scaler=scaler,
+      checkpoint_mode='model-only',
+  )
+  manifest = torch.load(latest, weights_only=True)
+  restored = train_torch._load_torch_file(latest, torch.device('cpu'))
+
+  assert manifest['checkpoint_mode'] == 'model-only'
+  assert set(manifest['shards']) == {'model', 'training'}
+  assert 'optimizer' not in restored
+  assert restored['model'].keys() == model.state_dict().keys()
 

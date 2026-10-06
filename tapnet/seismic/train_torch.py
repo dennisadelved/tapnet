@@ -39,6 +39,15 @@ def _parse_args() -> argparse.Namespace:
       '--device', choices=('auto', 'cpu', 'cuda'), default='auto'
   )
   parser.add_argument('--checkpoint-every', type=int, default=100)
+  parser.add_argument(
+      '--checkpoint-mode',
+      choices=('full', 'model-only'),
+      default='full',
+      help=(
+          'full saves resumable optimizer state; model-only is smaller and '
+          'can only be used for parameter initialization.'
+      ),
+  )
   parser.add_argument('--disable-amp', action='store_true')
   parser.add_argument(
       '--amp-dtype', choices=('bfloat16', 'float16'), default=None
@@ -101,11 +110,12 @@ def _load_torch_file(path: Path, device: torch.device):
       map_location=device,
       weights_only=True,
   )
-  training['optimizer'] = torch.load(
-      _checkpoint_shard_path(path.parent, shards['optimizer']),
-      map_location=device,
-      weights_only=True,
-  )
+  if 'optimizer' in shards:
+    training['optimizer'] = torch.load(
+        _checkpoint_shard_path(path.parent, shards['optimizer']),
+        map_location=device,
+        weights_only=True,
+    )
   return training
 
 
@@ -221,6 +231,7 @@ def _metrics_fieldnames(num_stages: int) -> list[str]:
       'source_checkpoint',
       'output_dir',
       'checkpoint_every',
+      'checkpoint_mode',
       'training_config_json',
       'loss_config_json',
       'elapsed_seconds',
@@ -325,7 +336,10 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.LRScheduler,
     scaler: torch.amp.GradScaler,
+    checkpoint_mode: str = 'full',
 ) -> Path:
+  if checkpoint_mode not in ('full', 'model-only'):
+    raise ValueError(f'Unsupported checkpoint mode: {checkpoint_mode!r}')
   output_dir.mkdir(parents=True, exist_ok=True)
   destination = output_dir / 'latest.pt'
   previous_manifest = _read_sharded_manifest(destination)
@@ -333,20 +347,23 @@ def _save_checkpoint(
   prefix = f'checkpoint_step{step:08d}_{token}'
   shard_names = {
       'model': f'{prefix}.model.pt',
-      'optimizer': f'{prefix}.optimizer.pt',
       'training': f'{prefix}.training.pt',
   }
+  if checkpoint_mode == 'full':
+    shard_names['optimizer'] = f'{prefix}.optimizer.pt'
   shard_payloads = {
       'model': model.state_dict(),
-      'optimizer': optimizer.state_dict(),
       'training': {
           'step': step,
           'config': dataclasses.asdict(config),
           'config_signature': _config_signature(config),
           'scheduler': scheduler.state_dict(),
           'scaler': scaler.state_dict(),
+          'checkpoint_mode': checkpoint_mode,
       },
   }
+  if checkpoint_mode == 'full':
+    shard_payloads['optimizer'] = optimizer.state_dict()
   final_shards = {
       key: _checkpoint_shard_path(output_dir, name)
       for key, name in shard_names.items()
@@ -357,14 +374,17 @@ def _save_checkpoint(
   }
   manifest_temporary = output_dir / f'latest_{token}.pt.tmp'
   created_paths = []
+  active_shard = 'none'
   try:
-    for key in ('model', 'optimizer', 'training'):
+    for key in shard_names:
+      active_shard = key
       _save_torch_payload(shard_payloads[key], temporary_shards[key])
       temporary_shards[key].replace(final_shards[key])
       created_paths.append(final_shards[key])
     _save_torch_payload(
         {
             'checkpoint_format': 'sharded_v1',
+            'checkpoint_mode': checkpoint_mode,
             'step': step,
             'shards': shard_names,
         },
@@ -390,9 +410,10 @@ def _save_checkpoint(
     )
     free_gib = shutil.disk_usage(output_dir).free / 1024**3
     raise RuntimeError(
-        f'Sharded checkpoint save failed at step {step}; {free_gib:.3f} GiB '
-        f'free in {output_dir}; {cleanup_status}. Any previous latest.pt was '
-        'preserved.'
+        f'Sharded checkpoint save failed at step {step} while writing '
+        f'{active_shard!r}; {free_gib:.3f} GiB volume-level free space in '
+        f'{output_dir} (this may not reflect a user or directory quota); '
+        f'{cleanup_status}. Any previous latest.pt was preserved.'
     ) from error
 
   if previous_manifest is not None:
@@ -425,6 +446,12 @@ def main() -> None:
       _load_torch_file(args.resume, device) if args.resume else None
   )
   if resume_state is not None:
+    if 'optimizer' not in resume_state:
+      raise ValueError(
+          'The requested --resume checkpoint is model-only and cannot restore '
+          'optimizer/scheduler state. Pass it with --pretrained-checkpoint to '
+          'start a new optimizer instead.'
+      )
     saved_config = resume_state.get('config', {})
     saved_freeze = bool(saved_config.get('freeze_feature_encoder', False))
     if saved_freeze and args.train_feature_encoder:
@@ -462,7 +489,7 @@ def main() -> None:
     start_step = int(resume_state['step'])
   elif args.pretrained_checkpoint:
     pretrained = _load_torch_file(args.pretrained_checkpoint, device)
-    model.load_state_dict(pretrained)
+    model.load_state_dict(pretrained.get('model', pretrained))
 
   if config.freeze_feature_encoder:
     _freeze_feature_encoder(model)
@@ -590,6 +617,7 @@ def main() -> None:
         'source_checkpoint': source_checkpoint,
         'output_dir': str(output_dir),
         'checkpoint_every': args.checkpoint_every,
+        'checkpoint_mode': args.checkpoint_mode,
         'training_config_json': json.dumps(
             dataclasses.asdict(config), sort_keys=True, separators=(',', ':')
         ),
@@ -643,6 +671,7 @@ def main() -> None:
           optimizer=optimizer,
           scheduler=scheduler,
           scaler=scaler,
+          checkpoint_mode=args.checkpoint_mode,
       )
       print(f'checkpoint={checkpoint}')
       last_checkpoint_step = completed_step
@@ -656,6 +685,7 @@ def main() -> None:
         optimizer=optimizer,
         scheduler=scheduler,
         scaler=scaler,
+        checkpoint_mode=args.checkpoint_mode,
     )
     print(f'checkpoint={checkpoint}')
   if device.type == 'cuda':
