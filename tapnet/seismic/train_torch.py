@@ -313,6 +313,7 @@ def main() -> None:
         else _move_batch(next(stream), device)
     )
     optimizer.zero_grad(set_to_none=True)
+    learning_rate = float(optimizer.param_groups[0]['lr'])
     autocast = (
         torch.amp.autocast('cuda', dtype=amp_dtype)
         if amp_enabled
@@ -346,7 +347,7 @@ def main() -> None:
     print(
         f'step={completed_step}/{config.steps} {scalar_text} '
         f'gradient_norm={float(gradient_norm):.6f} '
-        f'lr={scheduler.get_last_lr()[0]:.8f}'
+        f'lr={learning_rate:.8f}'
     )
 
     if completed_step % args.checkpoint_every == 0:

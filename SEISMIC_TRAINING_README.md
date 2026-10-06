@@ -284,6 +284,34 @@ The required next gate is a one-step FP32 run, followed by BF16 with the updated
 trainer. Neither mode is recorded as successful until it reports a finite
 gradient norm without a scheduler warning.
 
+FP32 VDI gate completed successfully on 2026-10-06:
+
+```text
+device                    cuda
+gpu                       NVIDIA L40-12Q
+feature encoder           frozen
+precision                 float32
+loss                      13.134300
+position loss             0.933581
+occlusion loss            1.552396
+probability loss          0.475143
+pre-clipping gradient     1178.522827
+peak allocated CUDA       0.814 GiB
+checkpoint                saved
+```
+
+The gradient norm was finite and clipped to the configured maximum of 1.0; no
+scheduler warning occurred. The large pre-clipping norm remains a stability
+warning for longer training. The displayed learning rate of `0.00000200` in
+this run was the rate prepared for the next step, not the rate used by the
+optimizer. Because `vdi-small` has a 100-step warmup, the first update used
+`0.00000100`. The trainer now captures and reports the rate actually used by
+the update.
+
+The FP32 result proves that the native-Windows CUDA training path and current
+constrained geometry fit comfortably in the 11 GB vGPU partition. The remaining
+precision gate is one BF16 step with the updated default configuration.
+
 ### PyTorch alternative for a locked-down Windows VDI
 
 PyTorch is the preferred alternative if the VDI cannot provide WSL2 or a Linux
