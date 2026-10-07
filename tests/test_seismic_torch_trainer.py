@@ -1,6 +1,7 @@
 """Focused safety tests for the PyTorch training loop."""
 
 import csv
+import sys
 
 import pytest
 
@@ -8,6 +9,18 @@ torch = pytest.importorskip('torch')
 
 from tapnet.seismic import train_torch
 from tapnet.seismic import torch_config
+
+
+def test_training_cli_accepts_temporal_length_override(monkeypatch):
+  monkeypatch.setattr(
+      sys,
+      'argv',
+      ['train_torch', '--config', 'vdi-hard', '--num-frames', '64'],
+  )
+
+  args = train_torch._parse_args()
+
+  assert args.num_frames == 64
 
 
 def test_nonfinite_gradient_is_rejected_before_optimizer_step():

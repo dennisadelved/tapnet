@@ -32,6 +32,12 @@ def _parse_args() -> argparse.Namespace:
       '--config', choices=torch_config.CONFIG_VARIANTS, default='vdi-small'
   )
   parser.add_argument('--output-dir', type=Path, required=True)
+  parser.add_argument(
+      '--num-frames',
+      type=int,
+      default=None,
+      help='Override the synthetic evaluation sequence length.',
+  )
   parser.add_argument('--num-examples', type=int, default=8)
   parser.add_argument(
       '--seed',
@@ -51,6 +57,8 @@ def _parse_args() -> argparse.Namespace:
   args = parser.parse_args()
   if args.num_examples < 1:
     parser.error('--num-examples must be positive.')
+  if args.num_frames is not None and args.num_frames < 2:
+    parser.error('--num-frames must be at least 2 when supplied.')
   if not 0.0 < args.visibility_threshold < 1.0:
     parser.error('--visibility-threshold must be between 0 and 1.')
   if args.queries_per_image < 1:
@@ -320,6 +328,14 @@ def _write_track_curtain(
 def main() -> None:
   args = _parse_args()
   config = torch_config.get_config(args.config)
+  if args.num_frames is not None:
+    config = dataclasses.replace(
+        config,
+        synthetic=dataclasses.replace(
+            config.synthetic, num_frames=args.num_frames
+        ),
+    )
+    config.validate()
   device = train_torch._select_device(args.device)
   model_state, checkpoint_metadata = _load_model_checkpoint(
       args.checkpoint, device

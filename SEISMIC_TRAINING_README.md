@@ -1270,6 +1270,80 @@ budget so the 128-sample window remains valid. Adding every omitted effect at
 once would make failures uninterpretable; subsequent additions should be
 driven by held-out and real-data error modes.
 
+### 64-frame temporal curriculum
+
+The hard 16-frame model used only 1.3869 GiB of PyTorch CUDA allocation on the
+L40-12Q, while the real application asks for 400 frames. Training and synthetic
+evaluation therefore accept `--num-frames N` as an explicit override. The next
+curriculum uses 64 frames: four times the hard training horizon and one sixth of
+the real sweep. Jumping directly to 400 is intentionally avoided until memory,
+runtime, optimization, and held-out behavior are measured at 64.
+
+Run one complete forward/backward/checkpoint step first. This is a memory and
+plumbing gate, not training evidence:
+
+```powershell
+$hardOutput = 'S:\Seismic\User\dadel\tapnet\checkpoints\seismic_tapir_torch_vdi_hard5000'
+$longSmoke = 'S:\Seismic\User\dadel\tapnet\runs\seismic_tapir_torch_vdi_long64_smoke1'
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-hard `
+  --num-frames 64 `
+  --steps 1 `
+  --device cuda `
+  --pretrained-checkpoint "$hardOutput\latest.pt" `
+  --output-dir $longSmoke `
+  --checkpoint-every 1 `
+  --checkpoint-mode model-only
+```
+
+Proceed only if the step is finite and `peak_cuda_memory_gib` leaves safe room
+below the VDI's 11 GiB dedicated limit. Approximately 8 GiB or less is the
+initial operational gate; this is deliberately conservative because other VDI
+processes and non-PyTorch CUDA allocations are not included in PyTorch's peak.
+If it exceeds that gate or fails with CUDA OOM, repeat at 32 frames and record
+the failure rather than reducing other dimensions silently.
+
+Before training, evaluate the hard-5,000 checkpoint on an untouched 64-frame
+stream so the new stage has an exact baseline:
+
+```powershell
+$longBaseline = 'S:\Seismic\User\dadel\tapnet\runs\seismic_tapir_torch_vdi_hard5000_long64_eval_seed3000000'
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.infer_torch `
+  --checkpoint "$hardOutput\latest.pt" `
+  --config vdi-hard `
+  --num-frames 64 `
+  --output-dir $longBaseline `
+  --num-examples 32 `
+  --seed 3000000 `
+  --device cuda
+```
+
+If both gates pass, start a fresh 3,000-step optimizer/scheduler from the hard
+weights. This is not an exact resume because sequence length changes:
+
+```powershell
+$longOutput = 'S:\Seismic\User\dadel\tapnet\checkpoints\seismic_tapir_torch_vdi_long64_3000'
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-hard `
+  --num-frames 64 `
+  --steps 3000 `
+  --device cuda `
+  --pretrained-checkpoint "$hardOutput\latest.pt" `
+  --output-dir $longOutput `
+  --checkpoint-every 500
+```
+
+The feature encoder remains frozen and the hard fault/noise/lateral-loss
+settings are retained. An interrupted long run must include both
+`--config vdi-hard` and `--num-frames 64` when resumed, or its checkpoint
+signature will correctly reject the mismatch. After training, evaluate the
+same seed with the long checkpoint and then repeat the identical real 400-frame
+forward/cycle test. Promotion requires better 64-frame held-out results and
+lower real cycle/lateral error without degrading forward depth continuity.
+
 Run a real seeded-track smoke after choosing a visible reflector in a seismic
 viewer. Annotation mode expects the actual inline number, crossline number, and
 Z header coordinate (for example TWT if that is how the cube is authored):
@@ -1397,7 +1471,8 @@ the real-ZGY comparison and cycle-consistency setup:
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
 - Final combined `python -m pytest -q` after adding configurable real-ZGY
-  sweep length, cycle consistency, and the hard curriculum: **66 passed**.
+  sweep length, cycle consistency, the hard curriculum, and synthetic temporal
+  overrides: **67 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -1548,6 +1623,63 @@ the real-ZGY comparison and cycle-consistency setup:
   calibration change that must be tested again over the intended 400 frames.
   A correct rerun must include `--num-frames 400`, and the resulting CSV must
   show `endpoint_frame=399` for every `endpoint=end` row.
+- The `vdi-hard` 5,000-step VDI curriculum completed on 2026-10-07 from
+  `seismic_tapir_torch_vdi_pretrained_frozen500/latest.pt` with the feature
+  encoder frozen, varying examples, CUDA BF16, and all intended hard settings
+  recorded in `metrics.csv`. All 5,000 steps were present and every logged loss
+  and gradient was finite. Mean total loss decreased monotonically by broad
+  blocks: 4.2364 (steps 1--500), 3.7914 (501--1,000), 3.4321
+  (1,001--2,000), 3.1406 (2,001--3,000), 2.9403 (3,001--4,000), and 2.7721
+  (4,001--5,000). First/last 100-step means were 4.5305 and 2.7501; final-step
+  loss was 2.3332. Peak CUDA allocation was 1.3869 GiB and elapsed time was
+  0.4701 hours. Logged gradient norms are pre-clipping: all exceeded the 1.0
+  limit, 247 exceeded 100, and the maximum was 1,599.26 at step 4,458. The
+  configured global-norm clipping was applied before every optimizer step, and
+  the isolated spike remained finite, but it reinforces that held-out metrics
+  rather than training loss must decide promotion. At that stage no held-out
+  or real-data result had yet been supplied for the checkpoint.
+- Held-out evaluation of the step-5,000 hard checkpoint then completed on 32
+  examples from hard seed 2,000,000 and easy seed 1,000,000. On `vdi-hard`,
+  depth MAE/RMSE were 0.4877/1.1474 samples, 91.74%/97.26%/98.57% of valid
+  positions were within 1/2/4 samples, gross errors above 8 samples were 0.51%,
+  lateral MAE was 0.3814 traces, and visibility accuracy/F1 were
+  0.9782/0.9864. On `vdi-small`, depth MAE/RMSE improved to 0.3560/0.8869,
+  96.39%/98.87%/99.42% were within 1/2/4 samples, gross errors were 0.41%,
+  lateral MAE was 0.3587 traces, and visibility accuracy/F1 were
+  0.9849/0.9915. Mean trackability was 0.7882 hard and 0.8819 easy. These are
+  strong absolute held-out synthetic results with no obvious easy-distribution
+  collapse. A strict improvement claim still requires the earlier 500-step
+  checkpoint evaluated on these exact same seeds/configurations; the supplied
+  summaries only evaluate the hard checkpoint. At that point, real 400-frame
+  forward and cycle behavior remained unmeasured.
+- The hard step-5,000 checkpoint was subsequently evaluated on the same real
+  20-seed, 400-crossline sweep with cycle consistency. The summary confirms
+  endpoint frames 0/399, checkpoint step 5,000, `vdi-hard`, seven depth
+  windows, and 40 attempted/in-bounds cycles. Forward mean/median trackability
+  were 0.8515/0.9931 and 86.80% of 8,000 predictions exceeded 0.5. Compared
+  with the earlier 500-step adapted run, mean per-seed maximum lateral drift
+  improved from 30.25 to 23.56 traces, global maximum drift from 55.64 to
+  45.81, mean per-seed maximum adjacent depth jump from 2.08 to 1.44 samples,
+  and source-frame mean absolute depth residual from 0.2753 to 0.1072 samples.
+  The global depth-jump maximum worsened from 5.94 to 7.45 samples, so the
+  improvement is not uniform. Hard and 500-step depths differed by 1.71
+  samples on average, 0.90 at the median, and 4.59 at the 95th percentile.
+- Long-range cycle closure exposed the remaining blocker. Only 26 of 40 cycles
+  were confidence-valid. Across all in-bounds cycles, mean round-trip lateral,
+  depth, and Euclidean errors were 14.32 traces, 2.54 samples, and 15.28 model
+  pixels; median Euclidean error was 13.13 and no cycle returned within two
+  model pixels. Among confidence-valid cycles, depth closure was substantially
+  better than lateral closure: 61.5% returned within one depth sample, 69.2%
+  within two, and 92.3% within four, but mean lateral error remained 13.98
+  traces. Large confidence-qualified failures reached 45.42 model pixels,
+  demonstrating that visibility confidence does not establish point identity.
+  The curtain remains visually coherent and forward metrics improved, but the
+  single 400-frame call does not preserve lateral identity under endpoint
+  reseeding. The next implementation should evaluate overlapping temporal
+  windows near the 16-frame training horizon and propagate/stitch tracks in
+  both directions before adding more synthetic training steps. This is a
+  stability proposal, not yet implemented; it must be compared with the same
+  one-shot output and cycle metrics.
 - Pretrained constrained smoke: one 128-by-128, 8-frame, 16-query update with
   the feature encoder frozen completed on CPU and saved a checkpoint.
 - That pretrained step reported a pre-clipping gradient norm of 1110.08; the

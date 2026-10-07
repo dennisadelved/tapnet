@@ -32,6 +32,12 @@ def _parse_args() -> argparse.Namespace:
       '--config', choices=torch_config.CONFIG_VARIANTS, default='smoke'
   )
   parser.add_argument('--steps', type=int, default=None)
+  parser.add_argument(
+      '--num-frames',
+      type=int,
+      default=None,
+      help='Override the synthetic training sequence length.',
+  )
   parser.add_argument('--output-dir', type=Path, default=None)
   parser.add_argument('--pretrained-checkpoint', type=Path)
   parser.add_argument('--resume', type=Path)
@@ -73,6 +79,8 @@ def _parse_args() -> argparse.Namespace:
     parser.error('--pretrained-checkpoint and --resume are mutually exclusive.')
   if args.steps is not None and args.steps < 1:
     parser.error('--steps must be positive.')
+  if args.num_frames is not None and args.num_frames < 2:
+    parser.error('--num-frames must be at least 2 when supplied.')
   if args.checkpoint_every < 1:
     parser.error('--checkpoint-every must be positive.')
   if args.encoder_lr_multiplier is not None and not (
@@ -465,6 +473,13 @@ def main() -> None:
   config = torch_config.get_config(args.config)
   if args.steps is not None:
     config = dataclasses.replace(config, steps=args.steps)
+  if args.num_frames is not None:
+    config = dataclasses.replace(
+        config,
+        synthetic=dataclasses.replace(
+            config.synthetic, num_frames=args.num_frames
+        ),
+    )
   if args.overfit_one_batch:
     config = dataclasses.replace(config, fixed_batch=True)
   if args.disable_amp:
