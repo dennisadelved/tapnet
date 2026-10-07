@@ -155,6 +155,140 @@ The upstream PyTorch inference model used an in-place residual addition in
 because the in-place form invalidated tensors required by autograd. A full-model
 forward/backward test protects this requirement.
 
+### Native-Windows PyTorch held-out inference
+
+`tapnet/seismic/infer_torch.py` loads legacy, model-only, or full sharded
+PyTorch checkpoints without loading the optimizer shard. It runs deterministic
+synthetic examples from a seed that is separate from the training stream and
+uses `model.eval()` plus `torch.inference_mode()`. CUDA BF16 is the default on
+the VDI; `--disable-amp` selects FP32.
+
+Every inference output directory contains:
+
+- `summary.json`: checkpoint identity, step, evaluation configuration, exact
+  example seeds, precision/device context, visibility rule, and aggregate
+  metrics;
+- `tracks.csv`: one row per example/query/frame with fault/reversal/horizon
+  context, query, prediction, target, validity, target visibility,
+  trackability probability, predicted visibility, and errors. Position errors
+  are blank for terminated or invalid targets;
+- `predictions.npz`: compressed lossless NumPy arrays for the single-channel
+  input amplitude, queries, predictions, labels, logits, trackability,
+  horizon groups, fault/reversal flags, and example seeds; and
+- `example_NNN_tracks.png`: interpreter-facing fixed-lateral seismic curtains.
+  Cyan is the visible target, magenta is the prediction, magenta points pass
+  the trackability threshold, and the yellow star is the query.
+
+The trackability probability follows upstream TAPIR post-processing:
+
+```text
+(1 - sigmoid(occlusion_logit))
+  * (1 - sigmoid(expected_distance_logit))
+```
+
+The default visibility decision threshold is `0.5` and is recorded in every
+output. Aggregate position metrics use only known, visible targets. Visibility
+metrics use every known target, including true terminations. Current metrics
+are depth MAE/RMSE, lateral MAE, depth accuracy within 1/2/4 samples, gross
+depth-error rate above 8 samples, visibility accuracy/precision/recall/F1,
+predicted-trackable fraction, and mean trackability probability.
+
+This evaluator is synthetic; the separate bounded real-volume path is described
+below. It does not emit SEG-Y/ZGY horizons, dense surfaces, confidence
+calibration curves, or metrics stratified by faults, terminations, and sweep
+direction. The PNG background is sampled at the query's fixed lateral trace;
+the CSV/NPZ must be used to inspect any predicted lateral drift.
+
+### Real ZGY seeded-track smoke path
+
+`tapnet/seismic/zgy.py` and `tapnet/seismic/infer_zgy_torch.py` implement the
+first real-volume path. The design follows the bounded-reader pattern inspected
+in the local `fault-prob-sfm/src/data/streaming.py` and
+`fault-prob-sfm/src/inference/streaming_io.py` implementations rather than
+loading a whole cube:
+
+- OpenZGY array order is treated as `[inline, crossline, sample]`;
+- one caller-owned `float32` window is read with `ZgyReader.read`;
+- the reader is held in a context manager and closed on every exit path;
+- `size`, `zstart`, `zinc`, `annotstart`, `annotinc`, ordered world corners,
+  and unit names are preserved; and
+- model predictions are converted back to fractional cube indices, line
+  annotations, Z coordinates, and interpolated world X/Y.
+
+An inline sweep reads `[8 frames, 128 crosslines, 128 samples]` and transposes
+it to model order `[frame, depth, lateral]`. A crossline sweep reads
+`[128 inlines, 8 frames, 128 samples]` and performs the corresponding
+transpose. The fixed-size window is centered on the seed and clamped at cube
+boundaries. Cubes smaller than the requested window are rejected rather than
+silently padded or resampled.
+
+The current CLI accepts one seed in either index coordinates or
+`[inline annotation, crossline annotation, Z header coordinate]`. It produces:
+
+- `tracks.csv` with model coordinates, cube indices, annotations, Z, world X/Y,
+  trackability, and the visibility decision for every frame;
+- `predictions.npz` with the exact bounded input, normalized input, logits,
+  tracks, coordinates, and confidence;
+- `track_curtain.png` on the seed's fixed lateral trace; and
+- `summary.json` with input/checkpoint provenance, complete ZGY geometry,
+  window/axis mapping, normalization, query mapping, and stability diagnostics.
+
+Real amplitudes are normalized per inference patch using the same functional
+form as the synthetic renderer: divide by the `99.5` percentile of absolute
+finite amplitude and clip to `[-1, 1]`. Non-finite values are replaced by zero
+and counted in `summary.json`; an all-nonfinite or zero-scale patch is rejected.
+This patch-local scaling is an explicit first-pass domain-adaptation shortcut.
+It is not yet a survey-level normalization policy and may make confidence
+incomparable across patches.
+
+The single-seed CLI does not ingest a real interpreted horizon, calculate
+real-data accuracy, fuse tracks into a surface, enforce inline/crossline
+agreement, or write a horizon grid/ZGY. The reported drift and trackability
+fields are diagnostics, not accuracy metrics. A confident track can still
+follow the wrong reflector. The separate multi-seed CLI is described below.
+
+### Multiple seeds from one real trace
+
+`tapnet/seismic/infer_zgy_peaks_torch.py` automates multiple queries from one
+inline/crossline trace. It reads the full sample axis only for the bounded
+8-frame-by-128-trace sweep block, picks local extrema on the source trace, and
+batches all compatible queries in overlapping model windows.
+
+The default peak policy is explicit and configurable:
+
+```text
+polarity                  both positive peaks and negative troughs
+relative amplitude        >= 0.1 * p99.5(abs(source trace))
+minimum seed spacing      4 samples
+maximum peak count        unlimited unless --max-peaks is supplied
+```
+
+Literal positive peaks use `--peak-polarity positive`; negative events use
+`negative`. The detector uses immediate-neighbor extrema, so the first and last
+samples cannot be selected. Candidates are processed strongest-first and a
+weaker candidate inside `--peak-min-distance` of an accepted event is removed.
+This is deterministic amplitude picking, not a prominence, phase, or geological
+event detector.
+
+Depth is covered with half-overlapping 128-sample windows plus an end-aligned
+window. Each seed is assigned to the containing window with the largest edge
+margin. All seeds assigned to a window are sent to TAPIR together; the existing
+query chunk size limits model memory. Fractional line requests are snapped to
+the nearest actual source trace and both requested and snapped coordinates are
+recorded.
+
+The multi-seed output has the same four artifact types as single-seed inference.
+`tracks.csv` adds seed ID, seed sample, amplitude and polarity. The NPZ also
+contains the exact source trace, every raw/normalized model window, window
+assignment, logits, and all survey coordinates. The PNG shows the full source
+trace curtain with tracks colored by seed sample.
+
+This first pass intentionally omits wavelet-aware peak consolidation, automatic
+polarity selection, peak picking across missing samples, amplitude/phase
+attributes, multi-trace seed voting, horizon ordering, track crossing checks,
+and surface fusion. It also reads the complete sample axis for the bounded
+horizontal block; very deep cubes may require depth-streamed peak detection.
+
 `tapnet/seismic/torch_config.py` contains two explicit variants:
 
 - `smoke`: 64-by-64, 2 frames, 2 queries, one refinement iteration, one step,
@@ -489,10 +623,11 @@ Implemented scope:
 
 Known omissions and risks:
 
-- no PyTorch evaluation command or seismic-metric report exists yet;
+- held-out PyTorch inference now exists, but it has not yet evaluated a model
+  trained on varying synthetic batches;
 - the 300-step BF16 fixed-batch run drives the final-head losses near zero, but
-  approximately 0.480581 aggregate intermediate-refinement loss remains and is
-  not separated by stage or loss term;
+  approximately 0.480581 aggregate intermediate-refinement loss remains; the
+  logger attributes nearly all of it to stage 0;
 - exact parity with the JAX checkpoint/training trajectory is not expected;
 - the current JAX/JAXline configuration cannot be reused directly;
 - peak allocated VRAM was approximately 0.815 GiB for the one-step BF16 run and
@@ -525,7 +660,10 @@ Run commands from the repository root. Do not use `pip install -e .` for this
 environment yet: the upstream `pyproject.toml` lists JAX/JAXline as unconditional
 dependencies. `requirements_seismic_torch.txt` intentionally supplies only the
 PyTorch-path runtime packages so the target environment need not install JAX or
-TensorFlow.
+TensorFlow. Matplotlib is included only for the inference PNG artifacts, and
+`pyzgy==0.1.1` supplies the `openzgy.api` reader used for local ZGY files.
+`sdglue` is not required for local files. ZFP-compressed ZGY input may require
+the optional `zfpy` package and has not been tested on the Windows VDI.
 
 Download or copy the official checkpoint to an ignored local directory:
 
@@ -909,6 +1047,123 @@ This is a fresh run, not a resume of the unstable shared-rate experiment. The
 head schedule still peaks at `1e-4`; the encoder schedule peaks at `1e-5`.
 Attach only `$tapnetOutput\metrics.csv` after completion or failure.
 
+The first non-overfit training/inference experiment uses varying synthetic
+batches, the stable frozen pretrained encoder, and one fixed held-out seed for
+a before/after comparison. Refresh the non-PyTorch runtime packages first so
+the new PNG writer dependency is present:
+
+```powershell
+.venv-torch\Scripts\python.exe -m pip install -r requirements_seismic_torch.txt
+```
+
+Evaluate the unadapted official checkpoint on exactly the held-out set that
+will be reused after training:
+
+```powershell
+$baselineOutput = 'checkpoints\seismic_tapir_torch_vdi_baseline_eval_seed1000000'
+.venv-torch\Scripts\python.exe -m tapnet.seismic.infer_torch `
+  --checkpoint checkpoints\pretrained\bootstapir_checkpoint_v2.pt `
+  --config vdi-small `
+  --output-dir $baselineOutput `
+  --num-examples 32 `
+  --seed 1000000 `
+  --device cuda
+```
+
+Then run a 500-step pilot on 500 different deterministic synthetic examples.
+Do not add `--overfit-one-batch`: this run measures adaptation rather than
+memorization. The encoder remains frozen because full-encoder stability has not
+yet passed the discriminative-rate ablation.
+
+```powershell
+$trainingOutput = 'checkpoints\seismic_tapir_torch_vdi_synthetic_pilot500'
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-small `
+  --steps 500 `
+  --device cuda `
+  --pretrained-checkpoint checkpoints\pretrained\bootstapir_checkpoint_v2.pt `
+  --output-dir $trainingOutput `
+  --checkpoint-every 100
+```
+
+Run inference on the identical held-out examples from the saved model:
+
+```powershell
+$inferenceOutput = 'checkpoints\seismic_tapir_torch_vdi_pilot500_eval_seed1000000'
+.venv-torch\Scripts\python.exe -m tapnet.seismic.infer_torch `
+  --checkpoint "$trainingOutput\latest.pt" `
+  --config vdi-small `
+  --output-dir $inferenceOutput `
+  --num-examples 32 `
+  --seed 1000000 `
+  --device cuda
+```
+
+Compare `$baselineOutput\summary.json` with
+`$inferenceOutput\summary.json`, inspect every generated PNG, and retain both
+`tracks.csv` files for query-level failure analysis. Improvement from one
+500-step run is not guaranteed and is not a promotion result. The main gate is
+lower held-out depth/lateral error without collapsing visibility recall. Do not
+select or tune on this seed repeatedly; a second untouched synthetic test seed
+must be introduced after the experiment design stabilizes.
+
+Run a real seeded-track smoke after choosing a visible reflector in a seismic
+viewer. Annotation mode expects the actual inline number, crossline number, and
+Z header coordinate (for example TWT if that is how the cube is authored):
+
+```powershell
+$cube = 'D:\data\survey.zgy'
+$checkpoint = 'checkpoints\seismic_tapir_torch_vdi_synthetic_pilot500\latest.pt'
+$realOutput = 'checkpoints\real_zgy_inline_seed001'
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.infer_zgy_torch `
+  --input $cube `
+  --checkpoint $checkpoint `
+  --output-dir $realOutput `
+  --config vdi-small `
+  --sweep inline `
+  --coordinates annotation `
+  --query-inline 43332 `
+  --query-crossline 39734 `
+  --query-z 884 `
+  --device cuda
+```
+
+Replace the example seed values with a pick from the target cube. If only
+zero-based voxel indices are known, pass `--coordinates index` and provide
+inline index, crossline index, and sample index through the same three query
+arguments. Repeat with `--sweep crossline` into a different output directory.
+The two tracks should meet at the seed and should be reviewed together; the CLI
+does not yet calculate their disagreement automatically.
+
+To select and track all configured extrema on one trace, omit `--query-z` and
+use the multi-seed command:
+
+```powershell
+$peakOutput = 'checkpoints\real_zgy_inline_trace_peaks001'
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.infer_zgy_peaks_torch `
+  --input $cube `
+  --checkpoint $checkpoint `
+  --output-dir $peakOutput `
+  --config vdi-small `
+  --sweep inline `
+  --coordinates annotation `
+  --query-inline 43332 `
+  --query-crossline 39734 `
+  --peak-polarity both `
+  --peak-relative-threshold 0.1 `
+  --peak-min-distance 4 `
+  --device cuda
+```
+
+Run the same trace with `--sweep crossline` into a separate directory. Use
+`--max-peaks` only when a deliberate compute cap is needed; if used, the
+strongest accepted extrema are retained and the cap is recorded. Raising the
+relative threshold or minimum distance changes the scientific seed-selection
+policy and must be treated as an experiment parameter, not an invisible
+performance shortcut.
+
 If the full gate remains blocked after removing obsolete artifacts, test whether
 the quota is specific to `Documents` using a model-only output under local app
 data:
@@ -977,7 +1232,7 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
-- Final combined `python -m pytest tests -q`: **39 passed**.
+- Final combined `python -m pytest tests -q`: **59 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -998,6 +1253,34 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
   checkpoint save, and resumed second step completed on CPU.
 - Official `bootstapir_checkpoint_v2.pt`: 218,886,140 bytes, strict state load
   succeeded with all keys matching the 54,699,335-parameter PyTorch model.
+- Native PyTorch inference completed end to end on CPU for one deterministic
+  `vdi-small` example from the official checkpoint. It wrote `summary.json`,
+  128 long-form CSV rows, compressed lossless arrays, and an inspected seismic
+  curtain PNG. Depth MAE was 4.9537 samples and visibility recall was 0.1681;
+  this one-example dependency/plumbing result is not a benchmark. Tests also
+  verify masked metrics, CSV semantics, the TAPIR visibility rule, and loading
+  the model shard without the optimizer shard.
+- Real ZGY inference completed in both inline and crossline directions on
+  `LowCretClino_ajax_2Deriv_phaserot_ELC_ajax.zgy`, a local
+  845-by-559-by-195 cube with 2-by-2 line annotation increments, `zstart=496`,
+  and `zinc=4`. The annotation seed `[43332, 39734, 884]` mapped exactly to
+  index `[422, 279, 97]`. Each direction performed one bounded read, produced
+  CSV/NPZ/JSON/PNG artifacts, and preserved cube indices, annotations, Z, and
+  world X/Y. Inline and crossline trackability ranges were 0.9848--0.9899 and
+  0.9978--0.9997; maximum predicted lateral drift from the seed was 1.395 and
+  1.337 traces. These are stability diagnostics from the unadapted official
+  checkpoint, not ground-truth accuracy or evidence of real-data readiness.
+  The independent world-coordinate interpolation matched
+  `ZgyReader.indexToWorld` exactly for a fractional predicted location.
+- Multi-seed inference on the same real trace selected 29 positive/negative
+  extrema using the documented 0.1 relative threshold and four-sample spacing.
+  Three overlapping depth windows produced 232 track rows in each sweep. At
+  the source trace, inline/crossline predicted-depth disagreement averaged
+  0.0775 samples and reached 0.6079 samples; mean source-frame residual from
+  the selected peak was 0.0947 samples inline and 0.0478 samples crossline.
+  Mean trackability was 0.9966 inline and 0.9992 crossline, while maximum
+  lateral drift reached 4.052 and 4.387 traces. This validates execution and
+  exposes drift; without interpreted targets it does not validate correctness.
 - Pretrained constrained smoke: one 128-by-128, 8-frame, 16-query update with
   the feature encoder frozen completed on CPU and saved a checkpoint.
 - That pretrained step reported a pre-clipping gradient norm of 1110.08; the
@@ -1094,10 +1377,15 @@ These omissions are material and must not be inferred as implemented:
    ablation is required before changing supervision or loss weights.
 3. **Pretrained CUDA optimization is validated, not generalization.** The
    official PyTorch BootsTAPIR checkpoint loads strictly and completed 100
-   frozen-encoder BF16 updates. No held-out PyTorch evaluation has been run.
-4. **No real-volume reader.** SEG-Y, ZGY, NumPy cube, horizon-grid ingestion,
-   survey normalization, inline/crossline metadata, and real-data split logic do
-   not exist yet.
+   frozen-encoder BF16 updates. The held-out evaluator is implemented, but no
+   model trained on varying synthetic batches has been evaluated on the VDI.
+4. **The real-volume path is only a seeded ZGY smoke.** Bounded local ZGY reads,
+   survey-coordinate restoration, inline/crossline inference, and multi-seed
+   batching for extrema on one trace exist. SEG-Y, NumPy cube and
+   interpreted-horizon ingestion, external seed tables, spatial multi-trace
+   seeding, survey-level normalization, surface fusion, and real-data split
+   logic do not exist yet. ZFP-compressed and cloud-hosted ZGY input are not
+   validated.
 5. **No full seismic forward model.** The procedural renderer does not model
    velocity, illumination, multiples, diffractions, migration artifacts,
    acquisition footprint, nonstationary wavelets, arbitrary phase rotation,
@@ -1117,8 +1405,9 @@ These omissions are material and must not be inferred as implemented:
    implemented.
 10. **No self-supervised adaptation.** Teacher/student consistency and
     high-confidence pseudo-label training are future work.
-11. **No physical-unit metrics.** Errors are in samples and traces, not
-    milliseconds, metres, or survey coordinates.
+11. **No physical-unit accuracy metrics.** Real outputs include header Z and
+    world X/Y, but no interpreted real target exists from which to calculate
+    errors in milliseconds or metres.
 12. **GPU validation is limited to one VDI.** Single-device CUDA BF16/FP32
     updates work on the L40-12Q. Throughput, multi-GPU reduction, long-run memory
     behavior, and exact numerical restart parity have not been tested.
@@ -1165,7 +1454,8 @@ These omissions are material and must not be inferred as implemented:
 
 ### P2: real-data transition
 
-1. Define the accepted cube and horizon-grid formats and coordinate transforms.
+1. Retain the documented ZGY coordinate contract and define interpreted-horizon
+   grid ingestion, SEG-Y/NumPy cube support, and their coordinate transforms.
 2. Build survey-level train/validation/test splits; never randomly split
    overlapping neighboring patches.
 3. Decide and document the geological policy at faults, unconformities, and

@@ -13,6 +13,12 @@ def test_torch_requirements_cover_direct_imports_without_selecting_torch_build()
       if line.strip() and not line.lstrip().startswith('#')
   }
 
-  assert {'numpy', 'einshape', 'dm-tree'} <= packages
+  assert {
+      'numpy',
+      'einshape',
+      'dm-tree',
+      'matplotlib',
+      'pyzgy==0.1.1',
+  } <= packages
   assert 'torch' not in packages
 
