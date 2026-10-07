@@ -215,12 +215,16 @@ loading a whole cube:
 - model predictions are converted back to fractional cube indices, line
   annotations, Z coordinates, and interpolated world X/Y.
 
-An inline sweep reads `[8 frames, 128 crosslines, 128 samples]` and transposes
-it to model order `[frame, depth, lateral]`. A crossline sweep reads
+By default, an inline sweep reads `[8 frames, 128 crosslines, 128 samples]` and
+transposes it to model order `[frame, depth, lateral]`. A crossline sweep reads
 `[128 inlines, 8 frames, 128 samples]` and performs the corresponding
-transpose. The fixed-size window is centered on the seed and clamped at cube
-boundaries. Cubes smaller than the requested window are rejected rather than
-silently padded or resampled.
+transpose. `--num-frames N` overrides the number of survey lines for either
+real-ZGY inference command without changing the 128-trace lateral or
+128-sample depth window. The line window is centered on the seed and clamped at
+cube boundaries. Cubes smaller than the requested window are rejected rather
+than silently padded or resampled. Larger values increase inference memory and
+runtime approximately linearly and have not yet been accuracy- or
+memory-benchmarked on the L40-12Q.
 
 The current CLI accepts one seed in either index coordinates or
 `[inline annotation, crossline annotation, Z header coordinate]`. It produces:
@@ -251,8 +255,9 @@ follow the wrong reflector. The separate multi-seed CLI is described below.
 
 `tapnet/seismic/infer_zgy_peaks_torch.py` automates multiple queries from one
 inline/crossline trace. It reads the full sample axis only for the bounded
-8-frame-by-128-trace sweep block, picks local extrema on the source trace, and
-batches all compatible queries in overlapping model windows.
+frame-by-128-trace sweep block (8 frames by default, or `--num-frames N`),
+picks local extrema on the source trace, and batches all compatible queries in
+overlapping model windows.
 
 The default peak policy is explicit and configurable:
 
@@ -1232,7 +1237,8 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
-- Final combined `python -m pytest tests -q`: **59 passed**.
+- Final combined `python -m pytest -q` after adding configurable real-ZGY
+  sweep length: **61 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.

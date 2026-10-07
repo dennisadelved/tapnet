@@ -1,5 +1,7 @@
 """Tests for real-volume TAPIR patch and coordinate mapping."""
 
+import dataclasses
+
 import numpy as np
 import pytest
 
@@ -72,6 +74,23 @@ def test_crossline_sweep_transposes_zgy_axes_to_frame_depth_lateral():
   )
   assert start == (3, 39, 13)
   np.testing.assert_allclose(query, [1.0, 32.0, 32.0])
+
+
+@pytest.mark.parametrize('sweep', ['inline', 'crossline'])
+def test_sweep_uses_overridden_frame_count(sweep):
+  config = torch_config.get_config('smoke')
+  config = dataclasses.replace(
+      config,
+      synthetic=dataclasses.replace(config.synthetic, num_frames=12),
+  )
+  values = np.zeros((70, 80, 90), dtype=np.float32)
+
+  video, _, query = infer_zgy_torch._window_and_video(
+      _ArrayReader(values), _geometry(), (35.0, 40.0, 45.0), config, sweep
+  )
+
+  assert video.shape == (12, 64, 64)
+  assert query[0] == 6.0
 
 
 def test_model_tracks_map_back_to_survey_coordinates():

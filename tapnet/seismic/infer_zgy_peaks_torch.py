@@ -32,6 +32,12 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument(
       '--config', choices=('smoke', 'vdi-small'), default='vdi-small'
   )
+  parser.add_argument(
+      '--num-frames',
+      type=int,
+      default=None,
+      help='Number of inline/crossline survey lines in the inference sweep.',
+  )
   parser.add_argument('--sweep', choices=('inline', 'crossline'), default='inline')
   parser.add_argument(
       '--coordinates', choices=('annotation', 'index'), default='annotation'
@@ -63,6 +69,8 @@ def _parse_args() -> argparse.Namespace:
   args = parser.parse_args()
   if args.input.suffix.lower() != '.zgy':
     parser.error('--input must be a .zgy file.')
+  if args.num_frames is not None and args.num_frames < 2:
+    parser.error('--num-frames must be at least 2 when supplied.')
   if not 0.0 <= args.peak_relative_threshold <= 1.0:
     parser.error('--peak-relative-threshold must be in [0, 1].')
   if args.peak_min_distance < 1:
@@ -350,6 +358,14 @@ def _write_curtain(
 def main() -> None:
   args = _parse_args()
   config = torch_config.get_config(args.config)
+  if args.num_frames is not None:
+    config = dataclasses.replace(
+        config,
+        synthetic=dataclasses.replace(
+            config.synthetic, num_frames=args.num_frames
+        ),
+    )
+    config.validate()
   device = train_torch._select_device(args.device)
   model_state, checkpoint_metadata = infer_torch._load_model_checkpoint(
       args.checkpoint, device
