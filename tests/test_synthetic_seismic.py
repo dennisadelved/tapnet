@@ -81,6 +81,17 @@ def test_horizons_do_not_cross():
   assert np.all(np.diff(surfaces, axis=0) > 0.0)
 
 
+def test_multiple_fault_config_generates_up_to_requested_count():
+  config = _small_config(fault_probability=1.0, max_faults=3)
+  counts = [
+      _make_horizons(config, np.random.default_rng(seed))[2]
+      for seed in range(20)
+  ]
+
+  assert all(1 <= count <= 3 for count in counts)
+  assert any(count > 1 for count in counts)
+
+
 def test_full_termination_probability_always_leaves_valid_query_points():
   config = _small_config(
       num_queries=32,
@@ -113,6 +124,7 @@ def test_seeded_generation_is_reproducible_and_stream_advances():
         {'num_frames': 1},
         {'height': 32},
         {'num_queries': 0},
+        {'max_faults': 0},
         {'wavelet_length': 16},
         {'fault_probability': 1.1},
     ],

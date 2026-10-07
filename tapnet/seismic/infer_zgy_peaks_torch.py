@@ -30,7 +30,7 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument('--checkpoint', type=Path, required=True)
   parser.add_argument('--output-dir', type=Path, required=True)
   parser.add_argument(
-      '--config', choices=('smoke', 'vdi-small'), default='vdi-small'
+      '--config', choices=torch_config.CONFIG_VARIANTS, default='vdi-small'
   )
   parser.add_argument(
       '--num-frames',

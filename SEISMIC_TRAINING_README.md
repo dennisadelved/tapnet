@@ -354,15 +354,23 @@ cycle plot, compare inline and crossline cycles, sample amplitudes along the
 predicted 3D paths, or calculate thresholds from interpreted validation data.
 The dependency-independent cycle metric tests pass locally; an end-to-end local
 ZGY smoke was omitted because the current workspace virtual environment lacks
-`pyzgy`. The VDI run is the required runtime validation.
+`pyzgy`. Subsequent VDI baseline and trained runs completed end to end, as
+recorded in the validation section.
 
-`tapnet/seismic/torch_config.py` contains two explicit variants:
+`tapnet/seismic/torch_config.py` contains three explicit variants:
 
 - `smoke`: 64-by-64, 2 frames, 2 queries, one refinement iteration, one step,
   random initialization, and plumbing validation only.
 - `vdi-small`: 128-by-128, 8 frames, 16 queries, the checkpoint-compatible
   pyramid, and 2,000 planned steps. This is the initial L40-12Q experiment, not
   a tuned final configuration.
+- `vdi-hard`: 128-by-128, 16 frames, 10 horizons, 24 queries, one to three
+  planar faults in every example, a cumulative 12-sample fault-throw budget,
+  noise standard deviation 0.18, termination probability 0.35, and 5,000
+  planned steps. It uses a `5e-5` peak learning rate with 250 warmup steps and
+  raises fixed-lateral supervision from 0.25 to 1.0 relative to depth. This is
+  the second-stage curriculum for the Windows VDI, not a final geological
+  simulator.
 
 ### Evaluation
 
@@ -1174,6 +1182,94 @@ lower held-out depth/lateral error without collapsing visibility recall. Do not
 select or tune on this seed repeatedly; a second untouched synthetic test seed
 must be introduced after the experiment design stabilizes.
 
+### Harder second-stage synthetic curriculum
+
+The 500-step frozen-encoder model improved 400-frame real forward continuity
+but retained large lateral drift and was less cycle-consistent than the
+baseline on the accidentally executed 8-frame cycle test. The next experiment
+therefore changes difficulty and temporal coverage rather than simply extending
+the original stream. `vdi-hard` adds multiple fault planes, increases the
+cumulative throw budget from 6 to 12 samples, doubles training frames from 8
+to 16, raises noise and termination frequency, increases queries from 16 to
+24, and gives fixed-lateral error the same loss weight as depth error.
+
+Start a new optimizer and scheduler from the successful 500-step model weights.
+This is intentionally `--pretrained-checkpoint`, not `--resume`, because the
+data configuration, loss, and schedule changed. The feature encoder remains
+frozen; do not pass `--train-feature-encoder`.
+
+First evaluate the existing 500-step checkpoint on the untouched hard stream;
+this is the before measurement for the new curriculum:
+
+```powershell
+$hardBaseline = 'checkpoints\seismic_tapir_torch_vdi_frozen500_hard_eval_seed2000000'
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.infer_torch `
+  --checkpoint checkpoints\seismic_tapir_torch_vdi_pretrained_frozen500\latest.pt `
+  --config vdi-hard `
+  --output-dir $hardBaseline `
+  --num-examples 32 `
+  --seed 2000000 `
+  --device cuda
+```
+
+```powershell
+$hardOutput = 'checkpoints\seismic_tapir_torch_vdi_hard5000'
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-hard `
+  --steps 5000 `
+  --device cuda `
+  --pretrained-checkpoint checkpoints\seismic_tapir_torch_vdi_pretrained_frozen500\latest.pt `
+  --output-dir $hardOutput `
+  --checkpoint-every 500
+```
+
+Expected startup includes `feature_encoder=frozen`, `precision=bfloat16`, and a
+`source_checkpoint` pointing at the 500-step model in `metrics.csv`. Full
+sharded checkpoints remain resumable and replace the previous generated shard
+set at each save. Resume an interrupted run without changing its configuration:
+
+```powershell
+.venv-torch\Scripts\python.exe -m tapnet.seismic.train_torch `
+  --config vdi-hard `
+  --steps 5000 `
+  --device cuda `
+  --resume "$hardOutput\latest.pt" `
+  --output-dir $hardOutput `
+  --checkpoint-every 500
+```
+
+Evaluate on a hard held-out stream before real-data comparison:
+
+```powershell
+$hardEval = 'checkpoints\seismic_tapir_torch_vdi_hard5000_eval_seed2000000'
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.infer_torch `
+  --checkpoint "$hardOutput\latest.pt" `
+  --config vdi-hard `
+  --output-dir $hardEval `
+  --num-examples 32 `
+  --seed 2000000 `
+  --device cuda
+```
+
+Do not compare raw training loss directly with the easier run: the sample
+distribution and lateral loss weight changed. Promotion requires comparing the
+`$hardBaseline\summary.json` and `$hardEval\summary.json`, then comparing the
+500-step and hard checkpoints on the original held-out `vdi-small` set and
+repeating the identical 400-frame forward and cycle commands. The hard run
+should reduce lateral drift and cycle error without degrading depth continuity
+or visibility.
+
+The harder generator still omits non-planar and listric faults, fault shadows,
+unconformities, stratigraphic pinch-outs beyond simple termination masks, salt,
+multiples, acquisition footprints, phase rotations, survey-specific wavelets,
+and real amplitude statistics. Multiple synthetic faults share a total throw
+budget so the 128-sample window remains valid. Adding every omitted effect at
+once would make failures uninterpretable; subsequent additions should be
+driven by held-out and real-data error modes.
+
 Run a real seeded-track smoke after choosing a visible reflector in a seismic
 viewer. Annotation mode expects the actual inline number, crossline number, and
 Z header coordinate (for example TWT if that is how the cube is authored):
@@ -1301,7 +1397,7 @@ the real-ZGY comparison and cycle-consistency setup:
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
 - Final combined `python -m pytest -q` after adding configurable real-ZGY
-  sweep length and cycle-consistency diagnostics: **62 passed**.
+  sweep length, cycle consistency, and the hard curriculum: **66 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -1313,6 +1409,11 @@ the real-ZGY comparison and cycle-consistency setup:
   one-off evaluator exited normally.
 - PyTorch 2.14.1+cpu on Python 3.10.11: all data, loss, configuration, resume
   sequence, and full-model autograd tests passed.
+- `vdi-hard` generation was sampled for 100 deterministic seeds: fault counts
+  were 32 one-fault, 27 two-fault, and 41 three-fault examples; every tested
+  horizon set remained ordered without crossings. A complete sample had shape
+  `[16, 128, 128, 3]` with 24 queries. This validates generator/configuration
+  plumbing, not a CUDA training step or geological realism.
 - PyTorch/JAX seismic loss values match on fixed randomized tensors within
   `1e-6` relative and absolute tolerance.
 - The upstream in-place residual addition was reproduced as an autograd failure,
@@ -1431,6 +1532,22 @@ the real-ZGY comparison and cycle-consistency setup:
   model-reported trackability, not geological accuracy. Interpreted targets or
   independent inline/crossline consistency are still required to distinguish
   correct tracking from smooth, confident tracking of the wrong reflector.
+- The first VDI cycle-consistency outputs completed for both the user-labeled
+  baseline and trained checkpoints, validating the end-to-end cycle artifact
+  path. Both CSVs contain endpoint frames 0 and 7, so they are 8-frame tests,
+  not the requested 400-frame test (which must contain endpoint frame 399).
+  All 40 cycles per checkpoint were in bounds and confidence-valid. Baseline
+  versus trained mean round-trip Euclidean error was 0.3737 versus 0.9859 model
+  pixels; mean absolute lateral error was 0.2124 versus 0.6980 traces; mean
+  absolute depth error was 0.2507 versus 0.5391 samples; and mean full-path
+  disagreement was 0.3153 versus 0.7817 model pixels. The corresponding maxima
+  were 0.8696 versus 2.3562 for round-trip error and 0.7508 versus 2.1608 for
+  mean path disagreement. The trained model was less cycle-consistent on this
+  local 8-frame test despite being substantially smoother and more confident
+  on the earlier 400-frame forward run. This exposes a real tradeoff or
+  calibration change that must be tested again over the intended 400 frames.
+  A correct rerun must include `--num-frames 400`, and the resulting CSV must
+  show `endpoint_frame=399` for every `endpoint=end` row.
 - Pretrained constrained smoke: one 128-by-128, 8-frame, 16-query update with
   the feature encoder frozen completed on CPU and saved a checkpoint.
 - That pretrained step reported a pre-clipping gradient norm of 1110.08; the

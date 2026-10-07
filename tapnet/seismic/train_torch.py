@@ -29,7 +29,7 @@ from tapnet.torch import tapir_model
 def _parse_args() -> argparse.Namespace:
   parser = argparse.ArgumentParser(description=__doc__)
   parser.add_argument(
-      '--config', choices=('smoke', 'vdi-small'), default='smoke'
+      '--config', choices=torch_config.CONFIG_VARIANTS, default='smoke'
   )
   parser.add_argument('--steps', type=int, default=None)
   parser.add_argument('--output-dir', type=Path, default=None)
@@ -596,7 +596,9 @@ def main() -> None:
   fixed_batch = (
       _move_batch(next(stream), device) if config.fixed_batch else None
   )
-  loss_config = torch_losses.SeismicLossConfig()
+  loss_config = torch_losses.SeismicLossConfig(
+      lateral_loss_weight=config.lateral_loss_weight
+  )
   metrics_path = output_dir / 'metrics.csv'
   metric_fieldnames = _metrics_fieldnames(config.num_pips_iter)
   _prepare_metrics_csv(metrics_path, metric_fieldnames)

@@ -7,7 +7,7 @@ import pytest
 from tapnet.seismic import torch_config
 
 
-@pytest.mark.parametrize('variant', ['smoke', 'vdi-small'])
+@pytest.mark.parametrize('variant', torch_config.CONFIG_VARIANTS)
 def test_config_variants_are_valid(variant):
   config = torch_config.get_config(variant)
   config.validate()
@@ -21,6 +21,19 @@ def test_vdi_config_is_explicitly_smaller_than_jax_default():
   assert config.synthetic.width == 128
   assert config.synthetic.num_queries == 16
   assert config.pyramid_level == 1
+
+
+def test_hard_config_extends_temporal_and_fault_curriculum():
+  config = torch_config.get_config('vdi-hard')
+
+  assert config.synthetic.num_frames == 16
+  assert config.synthetic.fault_probability == 1.0
+  assert config.synthetic.max_faults == 3
+  assert config.synthetic.max_fault_throw == 12.0
+  assert config.synthetic.noise_std == 0.18
+  assert config.synthetic.termination_probability == 0.35
+  assert config.lateral_loss_weight == 1.0
+  assert config.steps == 5000
 
 
 def test_unknown_config_is_rejected():

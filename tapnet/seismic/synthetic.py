@@ -32,6 +32,7 @@ class SyntheticSeismicConfig:
   noise_std: float = 0.12
   max_fault_throw: float = 12.0
   fault_probability: float = 0.7
+  max_faults: int = 1
   termination_probability: float = 0.25
   reverse_probability: float = 0.5
 
@@ -45,6 +46,8 @@ class SyntheticSeismicConfig:
       raise ValueError('num_horizons must be at least 2.')
     if self.num_queries < 1:
       raise ValueError('num_queries must be positive.')
+    if self.max_faults < 1:
+      raise ValueError('max_faults must be positive.')
     if self.wavelet_length < 3 or self.wavelet_length % 2 == 0:
       raise ValueError('wavelet_length must be an odd integer >= 3.')
     if not 0 < self.min_wavelet_frequency < self.max_wavelet_frequency < 0.5:
@@ -97,8 +100,8 @@ def _convolve_depth(reflectivity: np.ndarray, wavelet: np.ndarray) -> np.ndarray
 
 def _make_horizons(
     config: SyntheticSeismicConfig, rng: np.random.Generator
-) -> tuple[np.ndarray, np.ndarray, bool]:
-  """Returns depth surfaces, visibility masks, and whether a fault was used."""
+) -> tuple[np.ndarray, np.ndarray, int]:
+  """Returns depth surfaces, visibility masks, and generated fault count."""
   frame = np.linspace(-1.0, 1.0, config.num_frames, dtype=np.float32)
   lateral = np.linspace(-1.0, 1.0, config.width, dtype=np.float32)
   frame_grid, lateral_grid = np.meshgrid(frame, lateral, indexing='ij')
@@ -113,13 +116,20 @@ def _make_horizons(
   )
   shared_structure = dip + cross_dip + curvature + fold
 
-  faulted = bool(rng.random() < config.fault_probability)
-  if faulted:
+  fault_count = 0
+  if rng.random() < config.fault_probability:
+    fault_count = (
+        1
+        if config.max_faults == 1
+        else int(rng.integers(1, config.max_faults + 1))
+    )
+  for _ in range(fault_count):
     fault_slope = rng.uniform(-0.7, 0.7)
     fault_offset = rng.uniform(-0.45, 0.45)
     fault_side = frame_grid - fault_slope * lateral_grid > fault_offset
     fault_throw = rng.uniform(
-        -config.max_fault_throw, config.max_fault_throw
+        -config.max_fault_throw / fault_count,
+        config.max_fault_throw / fault_count,
     )
     shared_structure = shared_structure + fault_side * fault_throw
 
@@ -156,7 +166,7 @@ def _make_horizons(
     else:
       visibility[horizon_index] = boundary >= 0.0
 
-  return surface_array, visibility, faulted
+  return surface_array, visibility, fault_count
 
 
 def _render_amplitudes(
@@ -292,7 +302,7 @@ def generate_synthetic_sample(
   if not isinstance(rng, np.random.Generator):
     rng = np.random.default_rng(rng)
 
-  surfaces, visibility, faulted = _make_horizons(config, rng)
+  surfaces, visibility, fault_count = _make_horizons(config, rng)
   reversed_sweep = bool(rng.random() < config.reverse_probability)
   if reversed_sweep:
     surfaces = surfaces[:, ::-1]
@@ -305,7 +315,7 @@ def generate_synthetic_sample(
   return {
       'video': video.astype(np.float32),
       **tracks,
-      'faulted': np.asarray(faulted, dtype=bool),
+      'faulted': np.asarray(fault_count > 0, dtype=bool),
       'sweep_reversed': np.asarray(reversed_sweep, dtype=bool),
   }
 
