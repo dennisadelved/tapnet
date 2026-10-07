@@ -294,6 +294,68 @@ attributes, multi-trace seed voting, horizon ordering, track crossing checks,
 and surface fusion. It also reads the complete sample axis for the bounded
 horizontal block; very deep cubes may require depth-streamed peak detection.
 
+### Forward/backward cycle consistency
+
+Pass `--cycle-consistency` to the multi-seed real-ZGY command to run the first
+label-free consistency test. For every forward peak-seeded track, the test:
+
+1. takes the predicted `[lateral, depth]` point at the first frame and at the
+   last frame;
+2. re-queries TAPIR on the same normalized model window from each endpoint;
+3. measures the returned position at the original source frame against the
+   original seed; and
+4. measures mean and maximum full-path disagreement between the original and
+   endpoint-seeded tracks.
+
+Endpoints outside the 128-by-128 model window are recorded as out of bounds
+and are not silently clipped. A cycle is `confidence_valid` only when the
+forward endpoint and returned source probabilities both exceed
+`--visibility-threshold`. Metrics are reported separately for every in-bounds
+cycle and for this confidence-qualified subset. No geometric pass threshold is
+hard-coded in the first pass; the CSV retains lateral, depth, Euclidean, and
+full-path errors so thresholds can be selected from observed distributions.
+
+Example using the 500-step adapted checkpoint and the same 400-crossline test:
+
+```powershell
+$cube = 'D:\data\survey.zgy'
+$checkpoint = 'checkpoints\seismic_tapir_torch_vdi_pretrained_frozen500\latest.pt'
+$output = 'checkpoints\real_zgy_crossline_peaks400_cycle'
+
+.venv-torch\Scripts\python.exe -m tapnet.seismic.infer_zgy_peaks_torch `
+  --input $cube `
+  --checkpoint $checkpoint `
+  --output-dir $output `
+  --config vdi-small `
+  --num-frames 400 `
+  --sweep crossline `
+  --coordinates annotation `
+  --query-inline 22434 `
+  --query-crossline 282 `
+  --peak-polarity both `
+  --peak-relative-threshold 0.1 `
+  --peak-min-distance 4 `
+  --max-peaks 20 `
+  --cycle-consistency `
+  --device cuda
+```
+
+In addition to the normal inference artifacts, this writes
+`cycle_consistency.csv`, adds lossless endpoint queries, in-bounds masks,
+reseeded tracks, probabilities, and diagnostic arrays to `predictions.npz`, and
+adds aggregate distributions to `summary.json`. The terminal reports the
+number of confidence-valid cycles out of 40 attempted cycles for 20 seeds.
+
+Cycle consistency is not accuracy: both passes can consistently follow the
+same wrong reflector. It is also affected by endpoint confidence, paths leaving
+the local lateral/depth window, and the very long 400-frame extrapolation from
+8-frame synthetic training. The first implementation does not yet render a
+cycle plot, compare inline and crossline cycles, sample amplitudes along the
+predicted 3D paths, or calculate thresholds from interpreted validation data.
+The dependency-independent cycle metric tests pass locally; an end-to-end local
+ZGY smoke was omitted because the current workspace virtual environment lacks
+`pyzgy`. The VDI run is the required runtime validation.
+
 `tapnet/seismic/torch_config.py` contains two explicit variants:
 
 - `smoke`: 64-by-64, 2 frames, 2 queries, one refinement iteration, one step,
@@ -1232,13 +1294,14 @@ by Git because even a smoke checkpoint is approximately 373 MB.
 
 ## Validation record
 
-Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
+Validated on 2026-10-05 for JAX, 2026-10-06 for PyTorch, and 2026-10-07 for
+the real-ZGY comparison and cycle-consistency setup:
 
 - Upstream revision: `730cda1c730877cfedbe01bf87fb1cadb78a565d`.
 - Python 3.10 workspace-local virtual environment.
 - JAX 0.6.2 CPU, JAXlib 0.6.2, TensorFlow 2.21.0.
 - Final combined `python -m pytest -q` after adding configurable real-ZGY
-  sweep length: **61 passed**.
+  sweep length and cycle-consistency diagnostics: **62 passed**.
 - Python bytecode compilation: passed.
 - Import of seismic config and `tapnet.training.experiment`: passed without
   Kubric installed.
@@ -1287,6 +1350,87 @@ Validated on 2026-10-05 for JAX and 2026-10-06 for PyTorch:
   Mean trackability was 0.9966 inline and 0.9992 crossline, while maximum
   lateral drift reached 4.052 and 4.387 traces. This validates execution and
   exposes drift; without interpreted targets it does not validate correctness.
+- User-provided VDI artifacts inspected on 2026-10-07 contained a separate
+  500-step varying-synthetic training run and a 20-seed, 256-frame real-ZGY
+  crossline sweep. The training run was finite throughout and reduced mean
+  total loss from 17.2311 over its first 50 steps to 8.6947 over its last 50,
+  but its CSV records an empty `source_checkpoint`, a trainable encoder, and
+  only 8 training frames. It therefore trained all weights from random
+  initialization rather than adapting BootsTAPIR. The real sweep contained
+  5,120 predictions; mean trackability was 0.2737 and only 10.76% exceeded the
+  0.5 visibility threshold. Per-seed maximum adjacent-frame depth jumps ranged
+  from 2.75 to 63.37 samples. The plot draws every low-confidence trajectory as
+  a solid line and marks threshold-passing locations with dots, so the solid
+  curves must not be read as accepted horizons. The tracks CSV does not record
+  checkpoint provenance, so linkage between these two supplied artifacts
+  remains unverified. This run is rejected as an accuracy result because it
+  combines random initialization with a 32-fold train/inference frame-count
+  mismatch (8 versus 256) and has no interpreted real-data target. Future tests
+  must compare the official pretrained checkpoint and the adapted checkpoint
+  on identical 8-frame and then 16/32-frame windows before trying 256 frames.
+- A follow-up real-ZGY crossline curtain and tracks CSV supplied on 2026-10-07
+  were much more stable. The run used 20 seeds over 400 frames (8,000 rows,
+  crossline annotations 82--481). Mean/median trackability were 0.8101/0.9396,
+  85.66% of predictions exceeded 0.5, and the largest adjacent-frame depth
+  jump was 5.94 samples, compared with 0.2737 mean trackability, 10.76%
+  accepted, and a 63.37-sample jump in the rejected random-weight run. At the
+  source frame, absolute depth residual averaged 0.2753 samples and reached
+  0.7468. Most trajectories remained locally phase-consistent, although two
+  deep tracks near 3,400--3,600 Z units make visible corrections at the left
+  side and close tracks around 2,250--2,450 may switch or merge events.
+  Predicted lateral displacement from the source trace remains material: the
+  per-seed maximum averaged 30.25 traces and reached 55.64. The current PNG is
+  consequently a projection of a 3D path onto the fixed-inline source curtain;
+  it does not show the amplitude actually sampled at displaced lateral
+  coordinates. The separately supplied 500-step training CSV correctly records
+  `bootstapir_checkpoint_v2.pt` as its source, a frozen encoder, varying data,
+  BF16, no non-finite metrics, and mean total loss decreasing from 5.1899 over
+  the first 50 steps to 2.2022 over the last 50. The tracks CSV still lacks
+  checkpoint provenance, so association with that training run cannot be
+  proven without `summary.json`. There are still no interpreted targets; these
+  are stability and confidence diagnostics, not real-data accuracy.
+- A user-labeled official-checkpoint baseline tracks CSV was supplied for the
+  same 20 seeds, but it used 256 frames over crossline annotations 154--409
+  while the adapted run used 400 frames over 82--481. Across the common
+  256-crossline interval, baseline versus adapted mean trackability was
+  0.3803 versus 0.8479, median trackability was 0.3013 versus 0.9577, and the
+  fraction above 0.5 was 34.36% versus 89.32%. Mean per-seed maximum adjacent
+  depth jump fell from 9.55 to 1.26 samples and mean per-seed maximum lateral
+  drift fell from 54.89 to 22.50 traces; global maxima fell from 44.39 to 2.57
+  samples and 118.87 to 40.61 traces respectively. Predictions from the two
+  checkpoints differed by 1.83 depth samples on average, 1.18 at the median,
+  5.66 at the 95th percentile, and 43.49 at the worst point. That worst point
+  was seed 15 at crossline annotation 234, where both checkpoints assigned low
+  trackability. At the source crossline, the baseline adhered more exactly to
+  the supplied seed (0.1007 mean absolute sample residual versus 0.2753 for the
+  adapted run), though both were sub-sample on average. This comparison favors
+  the adapted model for continuity and model-reported confidence but is not a
+  controlled accuracy result: temporal window lengths differ, the baseline CSV
+  contains no checkpoint provenance, and synthetic fine-tuning may recalibrate
+  confidence without improving geology. A definitive A/B must use identical
+  `--num-frames`, inputs, seeds, normalization, and interpreted targets.
+- The user then supplied a 400-frame version of the user-labeled baseline,
+  enabling a frame-for-frame comparison with the adapted run: both contain the
+  same 20 seeds, 8,000 rows, and crossline annotations 82--481. Baseline versus
+  adapted mean trackability was 0.2876 versus 0.8101, median trackability was
+  0.1555 versus 0.9396, and the fraction above 0.5 was 24.96% versus 85.66%.
+  Mean per-seed maximum adjacent depth jump fell from 20.67 to 2.08 samples
+  and the global maximum fell from 109.38 to 5.94. Mean per-seed maximum
+  lateral drift fell from 69.31 to 30.25 traces and the global maximum from
+  124.97 to 55.64. The baseline retained tighter source-frame anchoring
+  (0.0989 mean and 0.2112 maximum absolute depth residual versus 0.2753 and
+  0.7468), although both remain sub-sample at the source. Across all rows, the
+  checkpoints differed by 2.74 depth samples on average, 1.28 at the median,
+  6.34 at the 95th percentile, and 137.70 at the maximum. Where both models
+  exceeded the 0.5 threshold (1,940 rows), depth disagreement averaged only
+  1.37 samples. The adapted model alone exceeded the threshold on 4,913 rows;
+  this large gain could represent improved tracking, synthetic-domain
+  confidence recalibration, or both. The largest disagreement was seed 19 at
+  crossline 113, where both scores were low (baseline 0.00008, adapted 0.0722).
+  This controlled comparison establishes improved numerical continuity and
+  model-reported trackability, not geological accuracy. Interpreted targets or
+  independent inline/crossline consistency are still required to distinguish
+  correct tracking from smooth, confident tracking of the wrong reflector.
 - Pretrained constrained smoke: one 128-by-128, 8-frame, 16-query update with
   the feature encoder frozen completed on CPU and saved a checkpoint.
 - That pretrained step reported a pre-clipping gradient norm of 1110.08; the

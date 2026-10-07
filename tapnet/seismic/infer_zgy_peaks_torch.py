@@ -58,6 +58,14 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument('--peak-min-distance', type=int, default=4)
   parser.add_argument('--max-peaks', type=int, default=None)
   parser.add_argument(
+      '--cycle-consistency',
+      action='store_true',
+      help=(
+          'Re-query from each predicted first/last-frame endpoint and measure '
+          'return error at the original source trace.'
+      ),
+  )
+  parser.add_argument(
       '--device', choices=('auto', 'cpu', 'cuda'), default='auto'
   )
   parser.add_argument('--disable-amp', action='store_true')
@@ -268,6 +276,228 @@ def _write_tracks_csv(
         })
 
 
+def _cycle_diagnostics(
+    *,
+    forward_tracks: np.ndarray,
+    forward_trackability: np.ndarray,
+    source_queries: np.ndarray,
+    endpoint_frames: np.ndarray,
+    endpoint_in_bounds: np.ndarray,
+    cycle_tracks: np.ndarray,
+    cycle_trackability: np.ndarray,
+    visibility_threshold: float,
+) -> dict[str, np.ndarray]:
+  """Measures endpoint-reseeded tracks against the original forward tracks."""
+  seed_count, endpoint_count = endpoint_in_bounds.shape
+  source_frames = np.rint(source_queries[:, 0]).astype(np.int32)
+  source_xy = source_queries[:, [2, 1]]
+  forward_endpoint_trackability = np.stack(
+      [forward_trackability[:, frame] for frame in endpoint_frames], axis=1
+  )
+  returned_source_xy = np.full(
+      (seed_count, endpoint_count, 2), np.nan, dtype=np.float32
+  )
+  returned_source_trackability = np.full(
+      (seed_count, endpoint_count), np.nan, dtype=np.float32
+  )
+  path_mean_error = np.full(
+      (seed_count, endpoint_count), np.nan, dtype=np.float32
+  )
+  path_max_error = np.full(
+      (seed_count, endpoint_count), np.nan, dtype=np.float32
+  )
+  for seed_id in range(seed_count):
+    for endpoint_id in range(endpoint_count):
+      if not endpoint_in_bounds[seed_id, endpoint_id]:
+        continue
+      source_frame = source_frames[seed_id]
+      returned_source_xy[seed_id, endpoint_id] = cycle_tracks[
+          seed_id, endpoint_id, source_frame
+      ]
+      returned_source_trackability[seed_id, endpoint_id] = cycle_trackability[
+          seed_id, endpoint_id, source_frame
+      ]
+      path_error = np.linalg.norm(
+          cycle_tracks[seed_id, endpoint_id] - forward_tracks[seed_id],
+          axis=-1,
+      )
+      path_mean_error[seed_id, endpoint_id] = float(np.mean(path_error))
+      path_max_error[seed_id, endpoint_id] = float(np.max(path_error))
+  return_delta = returned_source_xy - source_xy[:, None, :]
+  lateral_error = np.abs(return_delta[..., 0])
+  depth_error = np.abs(return_delta[..., 1])
+  euclidean_error = np.linalg.norm(return_delta, axis=-1)
+  confidence_valid = (
+      endpoint_in_bounds
+      & (forward_endpoint_trackability > visibility_threshold)
+      & (returned_source_trackability > visibility_threshold)
+  )
+  return {
+      'source_frame': source_frames,
+      'source_xy': source_xy.astype(np.float32),
+      'forward_endpoint_trackability': forward_endpoint_trackability.astype(
+          np.float32
+      ),
+      'returned_source_xy': returned_source_xy,
+      'returned_source_trackability': returned_source_trackability,
+      'roundtrip_lateral_error': lateral_error.astype(np.float32),
+      'roundtrip_depth_error': depth_error.astype(np.float32),
+      'roundtrip_euclidean_error': euclidean_error.astype(np.float32),
+      'path_mean_euclidean_error': path_mean_error,
+      'path_max_euclidean_error': path_max_error,
+      'confidence_valid': confidence_valid,
+  }
+
+
+def _metric_distribution(
+    values: np.ndarray, mask: np.ndarray
+) -> dict[str, float | int | None]:
+  selected = np.asarray(values, dtype=np.float64)[mask]
+  selected = selected[np.isfinite(selected)]
+  if not len(selected):
+    return {
+        'count': 0,
+        'mean': None,
+        'median': None,
+        'p95': None,
+        'max': None,
+    }
+  return {
+      'count': int(len(selected)),
+      'mean': float(np.mean(selected)),
+      'median': float(np.median(selected)),
+      'p95': float(np.percentile(selected, 95.0)),
+      'max': float(np.max(selected)),
+  }
+
+
+def _summarize_cycle_diagnostics(
+    diagnostics: dict[str, np.ndarray], endpoint_in_bounds: np.ndarray
+) -> dict[str, object]:
+  confident = diagnostics['confidence_valid']
+  return {
+      'attempted_cycle_count': int(endpoint_in_bounds.size),
+      'in_bounds_cycle_count': int(np.sum(endpoint_in_bounds)),
+      'confidence_valid_cycle_count': int(np.sum(confident)),
+      'in_bounds': {
+          'roundtrip_lateral_error_traces': _metric_distribution(
+              diagnostics['roundtrip_lateral_error'], endpoint_in_bounds
+          ),
+          'roundtrip_depth_error_samples': _metric_distribution(
+              diagnostics['roundtrip_depth_error'], endpoint_in_bounds
+          ),
+          'roundtrip_euclidean_error_model_pixels': _metric_distribution(
+              diagnostics['roundtrip_euclidean_error'], endpoint_in_bounds
+          ),
+          'path_mean_euclidean_error_model_pixels': _metric_distribution(
+              diagnostics['path_mean_euclidean_error'], endpoint_in_bounds
+          ),
+      },
+      'confidence_valid': {
+          'roundtrip_lateral_error_traces': _metric_distribution(
+              diagnostics['roundtrip_lateral_error'], confident
+          ),
+          'roundtrip_depth_error_samples': _metric_distribution(
+              diagnostics['roundtrip_depth_error'], confident
+          ),
+          'roundtrip_euclidean_error_model_pixels': _metric_distribution(
+              diagnostics['roundtrip_euclidean_error'], confident
+          ),
+          'path_mean_euclidean_error_model_pixels': _metric_distribution(
+              diagnostics['path_mean_euclidean_error'], confident
+          ),
+      },
+  }
+
+
+def _write_cycle_csv(
+    path: Path,
+    *,
+    peaks: np.ndarray,
+    seed_amplitude: np.ndarray,
+    endpoint_frames: np.ndarray,
+    endpoint_queries: np.ndarray,
+    endpoint_in_bounds: np.ndarray,
+    diagnostics: dict[str, np.ndarray],
+) -> None:
+  fields = [
+      'seed_id',
+      'seed_sample_index',
+      'seed_amplitude',
+      'seed_polarity',
+      'endpoint',
+      'endpoint_frame',
+      'endpoint_query_lateral',
+      'endpoint_query_depth',
+      'endpoint_in_bounds',
+      'forward_endpoint_trackability',
+      'returned_source_lateral',
+      'returned_source_depth',
+      'returned_source_trackability',
+      'roundtrip_lateral_error_traces',
+      'roundtrip_depth_error_samples',
+      'roundtrip_euclidean_error_model_pixels',
+      'path_mean_euclidean_error_model_pixels',
+      'path_max_euclidean_error_model_pixels',
+      'confidence_valid',
+  ]
+  endpoint_names = ('start', 'end')
+  with path.open('w', newline='', encoding='utf-8') as handle:
+    writer = csv.DictWriter(handle, fieldnames=fields)
+    writer.writeheader()
+    for seed_id, peak in enumerate(peaks):
+      polarity = 'positive' if seed_amplitude[seed_id] > 0 else 'negative'
+      for endpoint_id, endpoint_name in enumerate(endpoint_names):
+        returned = diagnostics['returned_source_xy'][seed_id, endpoint_id]
+        writer.writerow({
+            'seed_id': seed_id,
+            'seed_sample_index': int(peak),
+            'seed_amplitude': float(seed_amplitude[seed_id]),
+            'seed_polarity': polarity,
+            'endpoint': endpoint_name,
+            'endpoint_frame': int(endpoint_frames[endpoint_id]),
+            'endpoint_query_lateral': float(
+                endpoint_queries[seed_id, endpoint_id, 2]
+            ),
+            'endpoint_query_depth': float(
+                endpoint_queries[seed_id, endpoint_id, 1]
+            ),
+            'endpoint_in_bounds': bool(
+                endpoint_in_bounds[seed_id, endpoint_id]
+            ),
+            'forward_endpoint_trackability': float(
+                diagnostics['forward_endpoint_trackability'][
+                    seed_id, endpoint_id
+                ]
+            ),
+            'returned_source_lateral': float(returned[0]),
+            'returned_source_depth': float(returned[1]),
+            'returned_source_trackability': float(
+                diagnostics['returned_source_trackability'][
+                    seed_id, endpoint_id
+                ]
+            ),
+            'roundtrip_lateral_error_traces': float(
+                diagnostics['roundtrip_lateral_error'][seed_id, endpoint_id]
+            ),
+            'roundtrip_depth_error_samples': float(
+                diagnostics['roundtrip_depth_error'][seed_id, endpoint_id]
+            ),
+            'roundtrip_euclidean_error_model_pixels': float(
+                diagnostics['roundtrip_euclidean_error'][seed_id, endpoint_id]
+            ),
+            'path_mean_euclidean_error_model_pixels': float(
+                diagnostics['path_mean_euclidean_error'][seed_id, endpoint_id]
+            ),
+            'path_max_euclidean_error_model_pixels': float(
+                diagnostics['path_max_euclidean_error'][seed_id, endpoint_id]
+            ),
+            'confidence_valid': bool(
+                diagnostics['confidence_valid'][seed_id, endpoint_id]
+            ),
+        })
+
+
 def _write_curtain(
     path: Path,
     *,
@@ -431,6 +661,15 @@ def main() -> None:
       'expected_dist_logits': [],
       'trackability_probability': [],
   }
+  cycle_collected = {
+      'endpoint_queries': [],
+      'endpoint_in_bounds': [],
+      'tracks': [],
+      'trackability_probability': [],
+  }
+  endpoint_frames = np.asarray(
+      [0, config.synthetic.num_frames - 1], dtype=np.int32
+  )
   survey_collected: dict[str, list[np.ndarray]] = {}
   raw_windows = []
   normalized_windows = []
@@ -476,6 +715,74 @@ def main() -> None:
     trackability = infer_torch._trackability_probability(
         occlusion, expected
     ).astype(np.float32)
+    if args.cycle_consistency:
+      endpoint_xy = tracks[:, endpoint_frames, :]
+      endpoint_queries = np.empty(
+          (len(selected_peaks), len(endpoint_frames), 3), dtype=np.float32
+      )
+      endpoint_queries[..., 0] = endpoint_frames[None, :]
+      endpoint_queries[..., 1] = endpoint_xy[..., 1]
+      endpoint_queries[..., 2] = endpoint_xy[..., 0]
+      endpoint_in_bounds = (
+          np.all(np.isfinite(endpoint_xy), axis=-1)
+          & (endpoint_xy[..., 0] >= 0.0)
+          & (endpoint_xy[..., 0] <= config.synthetic.width - 1)
+          & (endpoint_xy[..., 1] >= 0.0)
+          & (endpoint_xy[..., 1] <= config.synthetic.height - 1)
+      )
+      cycle_tracks = np.full(
+          (
+              len(selected_peaks),
+              len(endpoint_frames),
+              config.synthetic.num_frames,
+              2,
+          ),
+          np.nan,
+          dtype=np.float32,
+      )
+      cycle_trackability = np.full(
+          (
+              len(selected_peaks),
+              len(endpoint_frames),
+              config.synthetic.num_frames,
+          ),
+          np.nan,
+          dtype=np.float32,
+      )
+      if np.any(endpoint_in_bounds):
+        valid_queries = endpoint_queries.reshape(-1, 3)[
+            endpoint_in_bounds.reshape(-1)
+        ]
+        cycle_autocast = (
+            torch.amp.autocast('cuda', dtype=amp_dtype)
+            if amp_enabled
+            else contextlib.nullcontext()
+        )
+        with torch.inference_mode(), cycle_autocast:
+          cycle_outputs = model(
+              torch.from_numpy(video).unsqueeze(0).to(device),
+              torch.from_numpy(valid_queries).unsqueeze(0).to(device),
+              is_training=False,
+              query_chunk_size=config.query_chunk_size,
+          )
+        valid_tracks = (
+            cycle_outputs['tracks'][0].detach().float().cpu().numpy()
+        )
+        valid_occlusion = (
+            cycle_outputs['occlusion'][0].detach().float().cpu().numpy()
+        )
+        valid_expected = (
+            cycle_outputs['expected_dist'][0].detach().float().cpu().numpy()
+        )
+        valid_trackability = infer_torch._trackability_probability(
+            valid_occlusion, valid_expected
+        ).astype(np.float32)
+        cycle_tracks.reshape(-1, config.synthetic.num_frames, 2)[
+            endpoint_in_bounds.reshape(-1)
+        ] = valid_tracks
+        cycle_trackability.reshape(-1, config.synthetic.num_frames)[
+            endpoint_in_bounds.reshape(-1)
+        ] = valid_trackability
     window_output_index = len(raw_windows)
     raw_windows.append(raw_patch)
     normalized_windows.append(normalized)
@@ -500,6 +807,17 @@ def main() -> None:
       collected['trackability_probability'].append(
           trackability[local_index]
       )
+      if args.cycle_consistency:
+        cycle_collected['endpoint_queries'].append(
+            endpoint_queries[local_index]
+        )
+        cycle_collected['endpoint_in_bounds'].append(
+            endpoint_in_bounds[local_index]
+        )
+        cycle_collected['tracks'].append(cycle_tracks[local_index])
+        cycle_collected['trackability_probability'].append(
+            cycle_trackability[local_index]
+        )
       for key, values in survey.items():
         survey_collected.setdefault(key, []).append(values)
 
@@ -510,6 +828,27 @@ def main() -> None:
   order = np.argsort(arrays['seed_sample_index'])
   arrays = {key: values[order] for key, values in arrays.items()}
   survey_arrays = {key: values[order] for key, values in survey_arrays.items()}
+  cycle_arrays = None
+  cycle_diagnostics = None
+  cycle_summary = None
+  if args.cycle_consistency:
+    cycle_arrays = {
+        key: np.asarray(values)[order]
+        for key, values in cycle_collected.items()
+    }
+    cycle_diagnostics = _cycle_diagnostics(
+        forward_tracks=arrays['model_tracks'],
+        forward_trackability=arrays['trackability_probability'],
+        source_queries=arrays['query_point_model'],
+        endpoint_frames=endpoint_frames,
+        endpoint_in_bounds=cycle_arrays['endpoint_in_bounds'],
+        cycle_tracks=cycle_arrays['tracks'],
+        cycle_trackability=cycle_arrays['trackability_probability'],
+        visibility_threshold=args.visibility_threshold,
+    )
+    cycle_summary = _summarize_cycle_diagnostics(
+        cycle_diagnostics, cycle_arrays['endpoint_in_bounds']
+    )
   peaks = arrays['seed_sample_index'].astype(np.int32)
   seed_amplitude = arrays['seed_amplitude'].astype(np.float32)
 
@@ -524,6 +863,31 @@ def main() -> None:
       visibility_threshold=args.visibility_threshold,
       sweep=args.sweep,
   )
+  if args.cycle_consistency:
+    _write_cycle_csv(
+        args.output_dir / 'cycle_consistency.csv',
+        peaks=peaks,
+        seed_amplitude=seed_amplitude,
+        endpoint_frames=endpoint_frames,
+        endpoint_queries=cycle_arrays['endpoint_queries'],
+        endpoint_in_bounds=cycle_arrays['endpoint_in_bounds'],
+        diagnostics=cycle_diagnostics,
+    )
+  cycle_npz = {}
+  if args.cycle_consistency:
+    cycle_npz = {
+        'cycle_endpoint_frames': endpoint_frames,
+        'cycle_endpoint_queries': cycle_arrays['endpoint_queries'],
+        'cycle_endpoint_in_bounds': cycle_arrays['endpoint_in_bounds'],
+        'cycle_model_tracks': cycle_arrays['tracks'],
+        'cycle_trackability_probability': cycle_arrays[
+            'trackability_probability'
+        ],
+        **{
+            f'cycle_{key}': value
+            for key, value in cycle_diagnostics.items()
+        },
+    }
   np.savez_compressed(
       args.output_dir / 'predictions.npz',
       source_trace=trace,
@@ -533,6 +897,7 @@ def main() -> None:
       window_normalization_scale=np.asarray(window_scales, dtype=np.float32),
       **arrays,
       **survey_arrays,
+      **cycle_npz,
   )
   _write_curtain(
       args.output_dir / 'track_curtain.png',
@@ -612,11 +977,25 @@ def main() -> None:
           'mean_trackability_probability': mean_trackability,
           'max_lateral_drift_traces': max_lateral_drift,
       },
+      'cycle_consistency': {
+          'enabled': args.cycle_consistency,
+          'endpoint_definition': 'first and last frame of the forward track',
+          'confidence_rule': (
+              'forward endpoint and returned source trackability both exceed '
+              f'{args.visibility_threshold}'
+          ),
+          'metrics': cycle_summary,
+      },
       'visibility_threshold': args.visibility_threshold,
       'artifacts': {
           'tracks': 'tracks.csv',
           'predictions': 'predictions.npz',
           'visualization': 'track_curtain.png',
+          **(
+              {'cycle_consistency': 'cycle_consistency.csv'}
+              if args.cycle_consistency
+              else {}
+          ),
       },
   }
   with (args.output_dir / 'summary.json').open('w', encoding='utf-8') as handle:
@@ -627,6 +1006,12 @@ def main() -> None:
   print(f'source_trace_index={snapped}')
   print(f'selected_peaks={len(peaks)}')
   print(f'model_windows={len(raw_windows)}')
+  if args.cycle_consistency:
+    print(
+        'confidence_valid_cycles='
+        f"{cycle_summary['confidence_valid_cycle_count']}/"
+        f"{cycle_summary['attempted_cycle_count']}"
+    )
   print(f'inference_output={args.output_dir}')
 
 

@@ -92,6 +92,47 @@ def test_peak_windows_cover_full_trace_and_maximize_edge_margin():
   np.testing.assert_array_equal(assignments, [0, 1, 2])
 
 
+def test_cycle_diagnostics_measure_return_and_ignore_invalid_endpoint():
+  forward_tracks = np.array(
+      [[[[4.0, 3.0], [5.0, 4.0], [6.0, 5.0]]]], dtype=np.float32
+  ).reshape(1, 3, 2)
+  cycle_tracks = np.full((1, 2, 3, 2), np.nan, dtype=np.float32)
+  cycle_tracks[0, 0] = forward_tracks[0]
+  cycle_tracks[0, 0, 1] = [5.5, 4.25]
+  cycle_trackability = np.full((1, 2, 3), np.nan, dtype=np.float32)
+  cycle_trackability[0, 0] = [0.8, 0.9, 0.7]
+
+  result = infer_zgy_peaks_torch._cycle_diagnostics(
+      forward_tracks=forward_tracks,
+      forward_trackability=np.array([[0.8, 0.9, 0.7]], dtype=np.float32),
+      source_queries=np.array([[1.0, 4.0, 5.0]], dtype=np.float32),
+      endpoint_frames=np.array([0, 2], dtype=np.int32),
+      endpoint_in_bounds=np.array([[True, False]]),
+      cycle_tracks=cycle_tracks,
+      cycle_trackability=cycle_trackability,
+      visibility_threshold=0.5,
+  )
+
+  assert result['roundtrip_lateral_error'][0, 0] == pytest.approx(0.5)
+  assert result['roundtrip_depth_error'][0, 0] == pytest.approx(0.25)
+  assert result['roundtrip_euclidean_error'][0, 0] == pytest.approx(
+      np.hypot(0.5, 0.25)
+  )
+  assert result['confidence_valid'].tolist() == [[True, False]]
+  assert np.isnan(result['roundtrip_euclidean_error'][0, 1])
+
+  summary = infer_zgy_peaks_torch._summarize_cycle_diagnostics(
+      result, np.array([[True, False]])
+  )
+
+  assert summary['attempted_cycle_count'] == 2
+  assert summary['in_bounds_cycle_count'] == 1
+  assert summary['confidence_valid_cycle_count'] == 1
+  assert summary['confidence_valid'][
+      'roundtrip_depth_error_samples'
+  ]['mean'] == pytest.approx(0.25)
+
+
 @pytest.mark.parametrize(
     ('sweep', 'expected_shape', 'expected_start', 'expected_query'),
     [
