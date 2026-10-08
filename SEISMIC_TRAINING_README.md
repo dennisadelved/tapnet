@@ -1409,11 +1409,12 @@ across resume, and are recorded as `temporal_stride` in every metrics row.
 generated sample. All views from a forced common seed share the same geology
 and amplitude normalization.
 
-The first pass deliberately does not yet change the TAPIR core, run all three
-views in one training step, fuse predictions, add a consistency loss, or read
-strided real-ZGY lines. The real ZGY readers still provide consecutive lines;
-the multi-stride checkpoint can be tested on them as a stride-1 input after
-the synthetic gates pass.
+The first pass deliberately does not change the TAPIR core, run all three
+views in one training step, fuse predictions, or add a consistency loss. Real
+multi-stride inference is implemented separately in
+`tapnet.seismic.infer_zgy_peaks_torch_multi_stride`: it reads one bounded dense
+block, constructs aligned stride views with identical source peaks and shared
+normalization, and exports disagreement rather than averaging across faults.
 
 Use the hard 5,000-step checkpoint as the preferred initialization when it is
 available. Otherwise the official BootsTAPIR checkpoint is a valid plumbing
@@ -1478,6 +1479,38 @@ foreach ($stride in 1, 2, 4) {
     --device cuda
 }
 ```
+
+Run aligned stride-1/2/4 inference on one real source trace:
+
+```powershell
+$cube = 'D:\data\survey.zgy'
+$multiOutput = 'S:\Seismic\User\dadel\tapnet\checkpoints\seismic_tapir_torch_vdi_multistride3000'
+$realMulti = 'S:\Seismic\User\dadel\tapnet\runs\real_zgy_multistride_inline2391'
+
+& $python -m tapnet.seismic.infer_zgy_peaks_torch_multi_stride `
+  --input $cube `
+  --checkpoint "$multiOutput\latest.pt" `
+  --output-dir $realMulti `
+  --config vdi-multistride `
+  --frames-per-view 32 `
+  --frame-strides 1 2 4 `
+  --sweep crossline `
+  --coordinates annotation `
+  --query-inline 2391 `
+  --query-crossline 880 `
+  --peak-polarity both `
+  --peak-relative-threshold 0.1 `
+  --peak-min-distance 4 `
+  --cycle-consistency `
+  --device cuda
+```
+
+The output contains `tracks_stride1.csv`, `tracks_stride2.csv`,
+`tracks_stride4.csv`, `cross_scale_disagreement.csv`, `predictions.npz`,
+`track_curtain_multistride.png`, and `summary.json`. Cycle CSVs are written per
+stride when requested. `summary.json` explicitly records `fusion.performed` as
+false; cross-scale disagreement is diagnostic evidence, not yet an accepted
+horizon or accuracy measurement.
 
 Before promotion, compare three controlled variants on identical held-out scene
 seeds: the existing consecutive-frame model, a model trained with balanced
