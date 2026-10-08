@@ -148,6 +148,50 @@ def test_cross_scale_disagreement_uses_only_shared_physical_lines():
   ]['mean'] == pytest.approx(1.0)
 
 
+def test_agreement_selects_only_outer_continuous_anchors():
+  geometry = _geometry()
+  sweep_indices = np.array([0, 2, 4, 6, 8])
+  first_depth = np.array([[10.0, 11.0, 12.0, 13.0, 14.0]])
+  second_depth = np.array([[14.0, 11.5, 12.5, 13.5, 14.5]])
+
+  def result(depth):
+    model_tracks = np.stack(
+        [np.full_like(depth, 5.0), depth], axis=-1
+    )
+    return {
+        'geometry': geometry,
+        'sweep_indices': sweep_indices,
+        'model_tracks': model_tracks,
+        'trackability': np.full_like(depth, 0.9),
+        'survey_tracks': {
+            'z_index': depth,
+            'crossline_index': np.full_like(depth, 5.0),
+        },
+    }
+
+  rows, anchors, summary = multi._multi_stride_agreement(
+      {1: result(first_depth), 2: result(second_depth)},
+      np.array([12]),
+      np.array([1.0]),
+      source_sweep_index=4,
+      sweep='inline',
+      depth_tolerance=1.0,
+      lateral_tolerance=1.0,
+      minimum_trackability=0.5,
+      minimum_rebase_distance=1,
+  )
+
+  assert [row['sweep_index'] for row in anchors] == [2, 8]
+  assert [row['rebase_direction'] for row in anchors] == [
+      'lower_index', 'higher_index'
+  ]
+  row_by_index = {row['sweep_index']: row for row in rows}
+  assert row_by_index[0]['multi_resolution_agree'] is False
+  assert row_by_index[0]['continuous_agreement_from_source'] is False
+  assert row_by_index[2]['continuous_agreement_from_source'] is True
+  assert summary['selected_anchor_count'] == 2
+
+
 def test_cli_writes_per_stride_and_disagreement_artifacts(
     tmp_path, monkeypatch
 ):
@@ -221,7 +265,7 @@ def test_cli_writes_per_stride_and_disagreement_artifacts(
           '--checkpoint', str(tmp_path / 'checkpoint.pt'),
           '--output-dir', str(output),
           '--config', 'smoke',
-          '--frames-per-view', '2',
+          '--frames-per-view', '4',
           '--frame-strides', '1', '2',
           '--sweep', 'crossline',
           '--coordinates', 'index',
@@ -229,6 +273,7 @@ def test_cli_writes_per_stride_and_disagreement_artifacts(
           '--query-crossline', '40',
           '--max-peaks', '2',
           '--cycle-consistency',
+          '--rebase-agreed',
           '--device', 'cpu',
       ],
   )
@@ -239,6 +284,9 @@ def test_cli_writes_per_stride_and_disagreement_artifacts(
       'tracks_stride1.csv',
       'tracks_stride2.csv',
       'cross_scale_disagreement.csv',
+      'multi_resolution_agreement.csv',
+      'rebase_anchors.csv',
+      'rebased_tracks.csv',
       'cycle_consistency_stride1.csv',
       'cycle_consistency_stride2.csv',
       'predictions.npz',
@@ -251,8 +299,10 @@ def test_cli_writes_per_stride_and_disagreement_artifacts(
   ) as handle:
     rows = list(csv.DictReader(handle))
   assert rows
-  assert {row['sweep_index'] for row in rows} == {'40'}
+  assert {row['sweep_index'] for row in rows} == {'38', '40'}
   summary = json.loads((output / 'summary.json').read_text(encoding='utf-8'))
   assert summary['model_config']['frame_strides'] == [1, 2]
   assert summary['fusion']['performed'] is False
   assert summary['cycle_consistency']['enabled'] is True
+  assert summary['rebasing']['enabled'] is True
+  assert summary['rebasing']['anchor_count'] > 0

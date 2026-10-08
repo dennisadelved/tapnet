@@ -59,6 +59,26 @@ def _parse_args() -> argparse.Namespace:
   parser.add_argument('--max-peaks', type=int, default=None)
   parser.add_argument('--cycle-consistency', action='store_true')
   parser.add_argument(
+      '--agreement-depth-tolerance', type=float, default=2.0,
+      help='Maximum depth spread in samples for a multi-stride agreement flag.',
+  )
+  parser.add_argument(
+      '--agreement-lateral-tolerance', type=float, default=2.0,
+      help='Maximum lateral spread in traces for a multi-stride agreement flag.',
+  )
+  parser.add_argument(
+      '--agreement-min-trackability', type=float, default=None,
+      help='Minimum probability at every stride; defaults to visibility threshold.',
+  )
+  parser.add_argument(
+      '--rebase-agreed', action='store_true',
+      help='Run one new multi-stride view from each outer continuous-agreement anchor.',
+  )
+  parser.add_argument(
+      '--rebase-min-distance', type=int, default=1,
+      help='Minimum survey-index distance from the original source for rebasing.',
+  )
+  parser.add_argument(
       '--device', choices=('auto', 'cpu', 'cuda'), default='auto'
   )
   parser.add_argument('--disable-amp', action='store_true')
@@ -87,6 +107,17 @@ def _parse_args() -> argparse.Namespace:
     parser.error('--max-peaks must be positive when supplied.')
   if not 0.0 < args.visibility_threshold < 1.0:
     parser.error('--visibility-threshold must be between 0 and 1.')
+  if args.agreement_depth_tolerance < 0.0:
+    parser.error('--agreement-depth-tolerance must be non-negative.')
+  if args.agreement_lateral_tolerance < 0.0:
+    parser.error('--agreement-lateral-tolerance must be non-negative.')
+  if (
+      args.agreement_min_trackability is not None
+      and not 0.0 < args.agreement_min_trackability < 1.0
+  ):
+    parser.error('--agreement-min-trackability must be between 0 and 1.')
+  if args.rebase_min_distance < 1:
+    parser.error('--rebase-min-distance must be positive.')
   if not 0.0 < args.normalization_percentile <= 100.0:
     parser.error('--normalization-percentile must be in (0, 100].')
   return args
@@ -441,6 +472,331 @@ def _write_disagreement_csv(path: Path, rows: list[dict[str, object]]) -> None:
     writer.writerows(rows)
 
 
+def _multi_stride_agreement(
+    results: dict[int, dict[str, object]],
+    peaks: np.ndarray,
+    seed_amplitude: np.ndarray,
+    *,
+    source_sweep_index: int,
+    sweep: str,
+    depth_tolerance: float,
+    lateral_tolerance: float,
+    minimum_trackability: float,
+    minimum_rebase_distance: int,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], dict[str, object]]:
+  """Flags all-stride agreement and selects continuous outer anchors."""
+  strides = sorted(results)
+  common = np.asarray(results[strides[0]]['sweep_indices'])
+  for stride in strides[1:]:
+    common = np.intersect1d(common, results[stride]['sweep_indices'])
+  frame_by_stride = {
+      stride: {
+          int(sweep_index): frame
+          for frame, sweep_index in enumerate(results[stride]['sweep_indices'])
+      }
+      for stride in strides
+  }
+  rows = []
+  rows_by_seed = {seed_id: [] for seed_id in range(len(peaks))}
+  for seed_id, peak in enumerate(peaks):
+    polarity = 'positive' if seed_amplitude[seed_id] > 0 else 'negative'
+    for sweep_index_value in common:
+      sweep_index = int(sweep_index_value)
+      frames = {
+          stride: frame_by_stride[stride][sweep_index]
+          for stride in strides
+      }
+      depths = np.asarray([
+          results[stride]['survey_tracks']['z_index'][
+              seed_id, frames[stride]
+          ]
+          for stride in strides
+      ], dtype=np.float32)
+      lateral_key = 'crossline_index' if sweep == 'inline' else 'inline_index'
+      laterals = np.asarray([
+          results[stride]['survey_tracks'][lateral_key][
+              seed_id, frames[stride]
+          ]
+          for stride in strides
+      ], dtype=np.float32)
+      trackability = np.asarray([
+          results[stride]['trackability'][seed_id, frames[stride]]
+          for stride in strides
+      ], dtype=np.float32)
+      finite = bool(
+          np.all(np.isfinite(depths))
+          and np.all(np.isfinite(laterals))
+          and np.all(np.isfinite(trackability))
+      )
+      depth_spread = float(np.ptp(depths)) if finite else float('nan')
+      lateral_spread = float(np.ptp(laterals)) if finite else float('nan')
+      min_trackability = float(np.min(trackability)) if finite else float('nan')
+      agrees = bool(
+          finite
+          and depth_spread <= depth_tolerance
+          and lateral_spread <= lateral_tolerance
+          and min_trackability >= minimum_trackability
+      )
+      geometry = results[strides[0]]['geometry']
+      annotation_axis = 0 if sweep == 'inline' else 1
+      row = {
+          'seed_id': seed_id,
+          'seed_sample_index': int(peak),
+          'seed_amplitude': float(seed_amplitude[seed_id]),
+          'seed_polarity': polarity,
+          'sweep_index': sweep_index,
+          'sweep_annotation': float(
+              geometry.annotstart[annotation_axis]
+              + sweep_index * geometry.annotinc[annotation_axis]
+          ),
+          'distance_from_source_indices': abs(
+              sweep_index - source_sweep_index
+          ),
+          'consensus_z_index': float(np.median(depths)),
+          'consensus_lateral_index': float(np.median(laterals)),
+          'depth_spread_samples': depth_spread,
+          'lateral_spread_traces': lateral_spread,
+          'minimum_trackability_probability': min_trackability,
+          'multi_resolution_agree': agrees,
+          'continuous_agreement_from_source': False,
+          'selected_rebase_anchor': False,
+          'rebase_direction': '',
+      }
+      rows.append(row)
+      rows_by_seed[seed_id].append(row)
+
+  anchors = []
+  for seed_rows in rows_by_seed.values():
+    source_rows = [
+        row for row in seed_rows if row['sweep_index'] == source_sweep_index
+    ]
+    if not source_rows or not source_rows[0]['multi_resolution_agree']:
+      continue
+    source_rows[0]['continuous_agreement_from_source'] = True
+    for direction, label in ((-1, 'lower_index'), (1, 'higher_index')):
+      candidates = sorted(
+          (
+              row for row in seed_rows
+              if direction * (row['sweep_index'] - source_sweep_index) > 0
+          ),
+          key=lambda row: row['distance_from_source_indices'],
+      )
+      outermost = None
+      for row in candidates:
+        if not row['multi_resolution_agree']:
+          break
+        row['continuous_agreement_from_source'] = True
+        if row['distance_from_source_indices'] >= minimum_rebase_distance:
+          outermost = row
+      if outermost is not None:
+        outermost['selected_rebase_anchor'] = True
+        outermost['rebase_direction'] = label
+        anchors.append(dict(outermost))
+
+  agreed = sum(bool(row['multi_resolution_agree']) for row in rows)
+  continuous = sum(
+      bool(row['continuous_agreement_from_source']) for row in rows
+  )
+  summary = {
+      'shared_physical_line_count': int(len(common)),
+      'comparison_count': len(rows),
+      'agreement_count': agreed,
+      'continuous_agreement_count': continuous,
+      'selected_anchor_count': len(anchors),
+      'seed_count_with_anchor': len({row['seed_id'] for row in anchors}),
+      'depth_tolerance_samples': depth_tolerance,
+      'lateral_tolerance_traces': lateral_tolerance,
+      'minimum_trackability_probability': minimum_trackability,
+      'minimum_rebase_distance_indices': minimum_rebase_distance,
+  }
+  return rows, anchors, summary
+
+
+def _write_rows_csv(path: Path, rows: list[dict[str, object]]) -> None:
+  if not rows:
+    return
+  with path.open('w', newline='', encoding='utf-8') as handle:
+    writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+
+
+def _run_rebased_views(
+    reader,
+    anchors: list[dict[str, object]],
+    *,
+    geometry: zgy.ZgyGeometry,
+    frame_count: int,
+    frame_strides: tuple[int, ...],
+    width: int,
+    height: int,
+    sweep: str,
+    model: torch.nn.Module,
+    device: torch.device,
+    query_chunk_size: int,
+    amp_enabled: bool,
+    amp_dtype: torch.dtype,
+    normalization_percentile: float,
+    visibility_threshold: float,
+) -> tuple[list[dict[str, object]], dict[str, object]]:
+  """Runs one centered multi-stride hop from continuous-agreement anchors."""
+  if not anchors:
+    return [], {'anchor_count': 0, 'view_count': 0, 'track_row_count': 0}
+  depth_starts = peaks_infer._depth_window_starts(geometry.size[2], height)
+  rows = []
+  view_summaries = []
+  anchors_by_line = {}
+  for anchor in anchors:
+    anchors_by_line.setdefault(int(anchor['sweep_index']), []).append(anchor)
+
+  for anchor_sweep_index, line_anchors in sorted(anchors_by_line.items()):
+    lateral_center = float(np.median([
+        anchor['consensus_lateral_index'] for anchor in line_anchors
+    ]))
+    if sweep == 'inline':
+      inline_index = anchor_sweep_index
+      crossline_index = lateral_center
+    else:
+      inline_index = lateral_center
+      crossline_index = anchor_sweep_index
+    (
+        block,
+        base_start,
+        _query_lateral,
+        _snapped,
+        local_views,
+        query_frames,
+    ) = _read_multistride_block(
+        reader,
+        geometry,
+        inline_index,
+        crossline_index,
+        frame_count=frame_count,
+        frame_strides=frame_strides,
+        width=width,
+        sweep=sweep,
+    )
+    lateral_start = base_start[1] if sweep == 'inline' else base_start[0]
+    anchor_depths = np.rint([
+        anchor['consensus_z_index'] for anchor in line_anchors
+    ]).astype(np.int32)
+    assignments = peaks_infer._assign_peaks_to_windows(
+        anchor_depths, depth_starts, height
+    )
+    sweep_indices = {
+        stride: _physical_sweep_indices(indices, base_start, sweep)
+        for stride, indices in local_views.items()
+    }
+    view_summaries.append({
+        'anchor_sweep_index': anchor_sweep_index,
+        'anchor_count': len(line_anchors),
+        'lateral_center_index': lateral_center,
+        'sweep_index_range_by_stride': {
+            str(stride): [
+                int(sweep_indices[stride][0]),
+                int(sweep_indices[stride][-1]),
+            ]
+            for stride in frame_strides
+        },
+    })
+
+    for window_index in np.unique(assignments):
+      selected = np.flatnonzero(assignments == window_index)
+      depth_start = int(depth_starts[window_index])
+      dense_patch = block[:, depth_start : depth_start + height, :]
+      dense_normalized, _scale, _nonfinite = (
+          infer_zgy_torch._normalize_amplitude(
+              dense_patch, normalization_percentile
+          )
+      )
+      for stride in frame_strides:
+        selected_anchors = [line_anchors[index] for index in selected]
+        queries = np.asarray([
+            [
+                query_frames[stride],
+                float(anchor['consensus_z_index']) - depth_start,
+                float(anchor['consensus_lateral_index']) - lateral_start,
+            ]
+            for anchor in selected_anchors
+        ], dtype=np.float32)
+        if np.any(queries[:, 2] < 0.0) or np.any(queries[:, 2] > width - 1):
+          raise ValueError(
+              'Agreed anchors at one sweep line exceed the lateral model '
+              'window; reduce drift before rebasing.'
+          )
+        video = np.repeat(
+            dense_normalized[local_views[stride]][..., None], 3, axis=-1
+        )
+        tracks, _occlusion, _expected, trackability = _run_model(
+            model,
+            video,
+            queries,
+            device=device,
+            query_chunk_size=query_chunk_size,
+            amp_enabled=amp_enabled,
+            amp_dtype=amp_dtype,
+        )
+        for local_index, anchor in enumerate(selected_anchors):
+          survey_tracks = _survey_tracks_at_indices(
+              tracks[local_index],
+              sweep_indices[stride],
+              base_start,
+              depth_start,
+              geometry,
+              sweep,
+          )
+          for frame, sweep_index in enumerate(sweep_indices[stride]):
+            rows.append({
+                'seed_id': int(anchor['seed_id']),
+                'seed_sample_index': int(anchor['seed_sample_index']),
+                'rebase_direction': anchor['rebase_direction'],
+                'anchor_sweep_index': anchor_sweep_index,
+                'anchor_consensus_z_index': float(
+                    anchor['consensus_z_index']
+                ),
+                'anchor_consensus_lateral_index': float(
+                    anchor['consensus_lateral_index']
+                ),
+                'temporal_stride': stride,
+                'model_frame': frame,
+                'sweep_index': int(sweep_index),
+                'inline_index': float(
+                    survey_tracks['inline_index'][frame]
+                ),
+                'crossline_index': float(
+                    survey_tracks['crossline_index'][frame]
+                ),
+                'z_index': float(survey_tracks['z_index'][frame]),
+                'inline_annotation': float(
+                    survey_tracks['inline_annotation'][frame]
+                ),
+                'crossline_annotation': float(
+                    survey_tracks['crossline_annotation'][frame]
+                ),
+                'z_coordinate': float(
+                    survey_tracks['z_coordinate'][frame]
+                ),
+                'world_x': float(survey_tracks['world_x'][frame]),
+                'world_y': float(survey_tracks['world_y'][frame]),
+                'model_lateral': float(tracks[local_index, frame, 0]),
+                'model_depth': float(tracks[local_index, frame, 1]),
+                'trackability_probability': float(
+                    trackability[local_index, frame]
+                ),
+                'predicted_visible': bool(
+                    trackability[local_index, frame]
+                    > visibility_threshold
+                ),
+            })
+  summary = {
+      'anchor_count': len(anchors),
+      'view_count': len(view_summaries),
+      'track_row_count': len(rows),
+      'views': view_summaries,
+  }
+  return rows, summary
+
+
 def _write_multistride_curtain(
     path: Path,
     *,
@@ -451,6 +807,7 @@ def _write_multistride_curtain(
     results: dict[int, dict[str, object]],
     geometry: zgy.ZgyGeometry,
     sweep: str,
+    agreement_rows: list[dict[str, object]] | None = None,
 ) -> None:
   curtain = block[:, :, query_lateral].T
   dense_indices = _physical_sweep_indices(
@@ -515,6 +872,45 @@ def _write_multistride_curtain(
       )
       for index, stride in enumerate(sorted(results))
   ]
+  agreement_rows = agreement_rows or []
+  agreed = [row for row in agreement_rows if row['multi_resolution_agree']]
+  anchors = [row for row in agreement_rows if row['selected_rebase_anchor']]
+  if agreed:
+    axis.scatter(
+        [row['sweep_annotation'] for row in agreed],
+        [
+            geometry.zstart + row['consensus_z_index'] * geometry.zinc
+            for row in agreed
+        ],
+        s=8,
+        c='#39ff88',
+        marker='o',
+        linewidths=0,
+        alpha=0.8,
+        zorder=4,
+    )
+    legend_handles.append(plt.Line2D(
+        [0], [0], color='#39ff88', marker='o', linestyle='none',
+        label='multi-stride agreement',
+    ))
+  if anchors:
+    axis.scatter(
+        [row['sweep_annotation'] for row in anchors],
+        [
+            geometry.zstart + row['consensus_z_index'] * geometry.zinc
+            for row in anchors
+        ],
+        s=42,
+        c='#ffd43b',
+        edgecolors='black',
+        marker='*',
+        linewidths=0.5,
+        zorder=5,
+    )
+    legend_handles.append(plt.Line2D(
+        [0], [0], color='#ffd43b', marker='*', markeredgecolor='black',
+        linestyle='none', label='selected rebase anchor',
+    ))
   axis.legend(handles=legend_handles, loc='upper right')
   axis.set_title(f'{len(peaks)} peak-seeded tracks; aligned multi-stride views')
   axis.set_xlabel(horizontal_label)
@@ -834,6 +1230,52 @@ def main() -> None:
       sweep=args.sweep,
       visibility_threshold=args.visibility_threshold,
   )
+  source_sweep_index = snapped[0] if args.sweep == 'inline' else snapped[1]
+  agreement_min_trackability = (
+      args.agreement_min_trackability
+      if args.agreement_min_trackability is not None
+      else args.visibility_threshold
+  )
+  agreement_rows, rebase_anchors, agreement_summary = (
+      _multi_stride_agreement(
+          results,
+          peaks,
+          seed_amplitude,
+          source_sweep_index=source_sweep_index,
+          sweep=args.sweep,
+          depth_tolerance=args.agreement_depth_tolerance,
+          lateral_tolerance=args.agreement_lateral_tolerance,
+          minimum_trackability=agreement_min_trackability,
+          minimum_rebase_distance=args.rebase_min_distance,
+      )
+  )
+  rebase_rows = []
+  rebase_summary = {
+      'enabled': args.rebase_agreed,
+      'anchor_count': len(rebase_anchors),
+      'view_count': 0,
+      'track_row_count': 0,
+  }
+  if args.rebase_agreed and rebase_anchors:
+    with zgy.open_zgy_reader(args.input) as reader:
+      rebase_rows, rebase_run_summary = _run_rebased_views(
+          reader,
+          rebase_anchors,
+          geometry=geometry,
+          frame_count=frame_count,
+          frame_strides=frame_strides,
+          width=config.synthetic.width,
+          height=config.synthetic.height,
+          sweep=args.sweep,
+          model=model,
+          device=device,
+          query_chunk_size=config.query_chunk_size,
+          amp_enabled=amp_enabled,
+          amp_dtype=amp_dtype,
+          normalization_percentile=args.normalization_percentile,
+          visibility_threshold=args.visibility_threshold,
+      )
+    rebase_summary.update(rebase_run_summary)
 
   args.output_dir.mkdir(parents=True, exist_ok=True)
   npz_values = {
@@ -900,6 +1342,11 @@ def main() -> None:
   _write_disagreement_csv(
       args.output_dir / 'cross_scale_disagreement.csv', disagreement_rows
   )
+  _write_rows_csv(
+      args.output_dir / 'multi_resolution_agreement.csv', agreement_rows
+  )
+  _write_rows_csv(args.output_dir / 'rebase_anchors.csv', rebase_anchors)
+  _write_rows_csv(args.output_dir / 'rebased_tracks.csv', rebase_rows)
   _write_multistride_curtain(
       args.output_dir / 'track_curtain_multistride.png',
       block=block,
@@ -909,6 +1356,7 @@ def main() -> None:
       results=results,
       geometry=geometry,
       sweep=args.sweep,
+      agreement_rows=agreement_rows,
   )
 
   snapped_annotation = zgy.index_to_annotation(
@@ -982,7 +1430,9 @@ def main() -> None:
       'diagnostics_not_accuracy_metrics': {
           'by_stride': stride_diagnostics,
           'cross_scale_disagreement': disagreement_summary,
+          'multi_resolution_agreement': agreement_summary,
       },
+      'rebasing': rebase_summary,
       'cycle_consistency': {
           'enabled': args.cycle_consistency,
           'by_stride': cycle_summaries,
@@ -1001,6 +1451,15 @@ def main() -> None:
               for stride in frame_strides
           },
           'cross_scale_disagreement': 'cross_scale_disagreement.csv',
+          'multi_resolution_agreement': 'multi_resolution_agreement.csv',
+          **(
+              {
+                  'rebase_anchors': 'rebase_anchors.csv',
+                  'rebased_tracks': 'rebased_tracks.csv',
+              }
+              if args.rebase_agreed and rebase_anchors
+              else {}
+          ),
           'predictions': 'predictions.npz',
           'visualization': 'track_curtain_multistride.png',
           **(
@@ -1024,6 +1483,8 @@ def main() -> None:
   print(f'frame_strides={frame_strides}')
   print(f'selected_peaks={len(peaks)}')
   print(f'model_windows={len(raw_windows)}')
+  print(f'multi_resolution_agreements={agreement_summary["agreement_count"]}')
+  print(f'rebase_anchors={len(rebase_anchors)}')
   print(f'inference_output={args.output_dir}')
 
 

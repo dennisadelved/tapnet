@@ -1501,15 +1501,28 @@ $realMulti = 'S:\Seismic\User\dadel\tapnet\runs\real_zgy_multistride_inline2391'
   --peak-polarity both `
   --peak-relative-threshold 0.1 `
   --peak-min-distance 4 `
+  --agreement-depth-tolerance 2 `
+  --agreement-lateral-tolerance 2 `
+  --agreement-min-trackability 0.5 `
+  --rebase-agreed `
+  --rebase-min-distance 4 `
   --cycle-consistency `
   --device cuda
 ```
 
 The output contains `tracks_stride1.csv`, `tracks_stride2.csv`,
-`tracks_stride4.csv`, `cross_scale_disagreement.csv`, `predictions.npz`,
-`track_curtain_multistride.png`, and `summary.json`. Cycle CSVs are written per
+`tracks_stride4.csv`, `cross_scale_disagreement.csv`,
+`multi_resolution_agreement.csv`, `predictions.npz`,
+`track_curtain_multistride.png`, and `summary.json`. Agreement requires every
+stride at a shared physical line to pass the depth, lateral, and trackability
+thresholds. Green plot markers show agreement. A rebase anchor is selected only
+at the outer edge of an unbroken agreement path from the original source; an
+isolated agreement beyond a failure is not eligible. With `--rebase-agreed`,
+the command centers one new multi-stride view on each selected anchor and writes
+`rebase_anchors.csv` plus `rebased_tracks.csv`. Gold stars show those anchors.
+This is one rebase hop, not recursive propagation. Cycle CSVs are written per
 stride when requested. `summary.json` explicitly records `fusion.performed` as
-false; cross-scale disagreement is diagnostic evidence, not yet an accepted
+false; cross-scale agreement is a gate for reseeding, not yet an accepted
 horizon or accuracy measurement.
 
 Before promotion, compare three controlled variants on identical held-out scene
