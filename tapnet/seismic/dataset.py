@@ -57,6 +57,9 @@ def create_synthetic_seismic_dataset(
       'trackgroup': tf.TensorSpec((config.num_queries,), tf.int32),
       'faulted': tf.TensorSpec((), tf.bool),
       'sweep_reversed': tf.TensorSpec((), tf.bool),
+      'frame_stride': tf.TensorSpec((), tf.int32),
+      'scene_num_frames': tf.TensorSpec((), tf.int32),
+      'frame_indices': tf.TensorSpec((config.num_frames,), tf.int32),
   }
   return tf.data.Dataset.from_generator(
       lambda: synthetic.iter_synthetic_samples(config, seed),

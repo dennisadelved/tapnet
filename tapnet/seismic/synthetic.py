@@ -35,6 +35,7 @@ class SyntheticSeismicConfig:
   max_faults: int = 1
   termination_probability: float = 0.25
   reverse_probability: float = 0.5
+  frame_strides: tuple[int, ...] = (1,)
 
   def validate(self) -> None:
     """Raises ``ValueError`` when dimensions cannot make valid examples."""
@@ -48,6 +49,12 @@ class SyntheticSeismicConfig:
       raise ValueError('num_queries must be positive.')
     if self.max_faults < 1:
       raise ValueError('max_faults must be positive.')
+    if not self.frame_strides:
+      raise ValueError('frame_strides must not be empty.')
+    if any(stride < 1 for stride in self.frame_strides):
+      raise ValueError('frame_strides must contain positive integers.')
+    if len(set(self.frame_strides)) != len(self.frame_strides):
+      raise ValueError('frame_strides must not contain duplicates.')
     if self.wavelet_length < 3 or self.wavelet_length % 2 == 0:
       raise ValueError('wavelet_length must be an odd integer >= 3.')
     if not 0 < self.min_wavelet_frequency < self.max_wavelet_frequency < 0.5:
@@ -287,12 +294,16 @@ def _sample_tracks(
 def generate_synthetic_sample(
     config: SyntheticSeismicConfig,
     rng: Union[np.random.Generator, int, None] = None,
+    *,
+    frame_stride: int | None = None,
 ) -> Mapping[str, np.ndarray]:
   """Generates one deterministic TAPIR-compatible seismic example.
 
   Args:
     config: Geometry and simulation controls.
     rng: NumPy generator or seed.  ``None`` requests a non-deterministic seed.
+    frame_stride: Optional explicit member of ``config.frame_strides``. When
+      omitted, one configured stride is selected uniformly.
 
   Returns:
     A mapping with video, query/target coordinates, occlusion, supervision
@@ -302,13 +313,33 @@ def generate_synthetic_sample(
   if not isinstance(rng, np.random.Generator):
     rng = np.random.default_rng(rng)
 
-  surfaces, visibility, fault_count = _make_horizons(config, rng)
+  if frame_stride is not None and frame_stride not in config.frame_strides:
+    raise ValueError(
+        f'frame_stride {frame_stride} is not in configured frame_strides '
+        f'{config.frame_strides!r}.'
+    )
+
+  scene_num_frames = (
+      (config.num_frames - 1) * max(config.frame_strides) + 1
+  )
+  scene_config = dataclasses.replace(
+      config, num_frames=scene_num_frames, frame_strides=(1,)
+  )
+  surfaces, visibility, fault_count = _make_horizons(scene_config, rng)
   reversed_sweep = bool(rng.random() < config.reverse_probability)
   if reversed_sweep:
     surfaces = surfaces[:, ::-1]
     visibility = visibility[:, ::-1]
 
-  amplitudes = _render_amplitudes(surfaces, visibility, config, rng)
+  amplitudes = _render_amplitudes(surfaces, visibility, scene_config, rng)
+  if frame_stride is None:
+    frame_stride = int(rng.choice(config.frame_strides))
+  frame_indices = (
+      np.arange(config.num_frames, dtype=np.int32) * frame_stride
+  )
+  surfaces = surfaces[:, frame_indices]
+  visibility = visibility[:, frame_indices]
+  amplitudes = amplitudes[frame_indices]
   tracks = _sample_tracks(surfaces, visibility, config, rng)
   video = np.repeat(amplitudes[..., None], 3, axis=-1)
 
@@ -317,6 +348,9 @@ def generate_synthetic_sample(
       **tracks,
       'faulted': np.asarray(fault_count > 0, dtype=bool),
       'sweep_reversed': np.asarray(reversed_sweep, dtype=bool),
+      'frame_stride': np.asarray(frame_stride, dtype=np.int32),
+      'scene_num_frames': np.asarray(scene_num_frames, dtype=np.int32),
+      'frame_indices': frame_indices,
   }
 
 
@@ -325,8 +359,15 @@ def iter_synthetic_samples(
 ) -> Iterator[Mapping[str, np.ndarray]]:
   """Yields a reproducible infinite stream of independent examples."""
   stream_rng = np.random.default_rng(seed)
+  sample_index = 0
   while True:
     sample_seed = int(
         stream_rng.integers(0, np.iinfo(np.int64).max, dtype=np.int64)
     )
-    yield generate_synthetic_sample(config, sample_seed)
+    frame_stride = config.frame_strides[
+        sample_index % len(config.frame_strides)
+    ]
+    yield generate_synthetic_sample(
+        config, sample_seed, frame_stride=frame_stride
+    )
+    sample_index += 1

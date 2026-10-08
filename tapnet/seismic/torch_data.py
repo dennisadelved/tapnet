@@ -39,8 +39,11 @@ class SyntheticSeismicIterableDataset(data.IterableDataset):
               1, dtype=np.uint64
           )[0]
       )
+      frame_stride = self._config.frame_strides[
+          sample_index % len(self._config.frame_strides)
+      ]
       sample = synthetic.generate_synthetic_sample(
-          self._config, rng=sample_seed
+          self._config, rng=sample_seed, frame_stride=frame_stride
       )
       yield {
           key: torch.from_numpy(np.asarray(value))

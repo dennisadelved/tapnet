@@ -54,3 +54,27 @@ def test_start_index_resumes_the_same_sample_sequence():
   for key in second:
     assert torch.equal(second[key], resumed[key])
 
+
+def test_multistride_dataset_is_balanced_and_resume_preserves_stride():
+  config = synthetic.SyntheticSeismicConfig(
+      num_frames=2,
+      height=64,
+      width=16,
+      num_horizons=4,
+      num_queries=2,
+      wavelet_length=17,
+      max_fault_throw=2.0,
+      frame_strides=(1, 2, 4),
+  )
+  stream = iter(torch_data.SyntheticSeismicIterableDataset(config, seed=13))
+
+  strides = [int(next(stream)['frame_stride']) for _ in range(4)]
+  resumed = next(iter(
+      torch_data.SyntheticSeismicIterableDataset(
+          config, seed=13, start_index=4
+      )
+  ))
+
+  assert strides == [1, 2, 4, 1]
+  assert int(resumed['frame_stride']) == 2
+

@@ -38,6 +38,12 @@ def _parse_args() -> argparse.Namespace:
       default=None,
       help='Override the synthetic evaluation sequence length.',
   )
+  parser.add_argument(
+      '--frame-stride',
+      type=int,
+      default=None,
+      help='Evaluate one explicit survey-line stride instead of the config mix.',
+  )
   parser.add_argument('--num-examples', type=int, default=8)
   parser.add_argument(
       '--seed',
@@ -59,6 +65,8 @@ def _parse_args() -> argparse.Namespace:
     parser.error('--num-examples must be positive.')
   if args.num_frames is not None and args.num_frames < 2:
     parser.error('--num-frames must be at least 2 when supplied.')
+  if args.frame_stride is not None and args.frame_stride < 1:
+    parser.error('--frame-stride must be positive when supplied.')
   if not 0.0 < args.visibility_threshold < 1.0:
     parser.error('--visibility-threshold must be between 0 and 1.')
   if args.queries_per_image < 1:
@@ -194,6 +202,8 @@ def _write_tracks_csv(
     trackgroup: np.ndarray,
     faulted: np.ndarray,
     sweep_reversed: np.ndarray,
+    frame_strides: np.ndarray,
+    frame_indices: np.ndarray,
     visibility_threshold: float,
 ) -> None:
   fields = [
@@ -201,9 +211,11 @@ def _write_tracks_csv(
       'example_seed',
       'example_faulted',
       'sweep_reversed',
+      'temporal_stride',
       'query_id',
       'query_trackgroup',
       'frame',
+      'scene_frame_index',
       'query_frame',
       'query_depth',
       'query_lateral',
@@ -236,9 +248,11 @@ def _write_tracks_csv(
               'example_seed': example_seed,
               'example_faulted': bool(faulted[example_id]),
               'sweep_reversed': bool(sweep_reversed[example_id]),
+              'temporal_stride': int(frame_strides[example_id]),
               'query_id': query_id,
               'query_trackgroup': int(trackgroup[example_id, query_id]),
               'frame': frame,
+              'scene_frame_index': int(frame_indices[example_id, frame]),
               'query_frame': float(query[0]),
               'query_depth': float(query[1]),
               'query_lateral': float(query[2]),
@@ -272,6 +286,7 @@ def _write_track_curtain(
     target_tracks: np.ndarray,
     target_occluded: np.ndarray,
     trackability: np.ndarray,
+    frame_indices: np.ndarray,
     visibility_threshold: float,
     max_queries: int,
 ) -> None:
@@ -282,7 +297,7 @@ def _write_track_curtain(
       row_count, column_count, figsize=(7 * column_count, 3 * row_count),
       squeeze=False, constrained_layout=True
   )
-  frames = np.arange(video_amplitude.shape[0])
+  frames = frame_indices
   for query_id, axis in enumerate(axes.flat):
     if query_id >= query_count:
       axis.axis('off')
@@ -298,7 +313,12 @@ def _write_track_curtain(
         vmax=scale,
         origin='upper',
         aspect='auto',
-        extent=(-0.5, len(frames) - 0.5, curtain.shape[0] - 0.5, -0.5),
+        extent=(
+            frames[0] - 0.5,
+            frames[-1] + 0.5,
+            curtain.shape[0] - 0.5,
+            -0.5,
+        ),
     )
     target_depth = target_tracks[query_id, :, 1].copy()
     target_depth[target_occluded[query_id]] = np.nan
@@ -314,11 +334,12 @@ def _write_track_curtain(
         color='#ff2d95', s=12
     )
     axis.scatter(
-        [query[0]], [query[1]], marker='*', color='#ffe600', edgecolor='black',
+        [frames[int(query[0])]], [query[1]], marker='*', color='#ffe600',
+        edgecolor='black',
         s=90, zorder=4, label='query'
     )
     axis.set_title(f'query {query_id}, lateral trace {lateral}')
-    axis.set_xlabel('frame (inline/crossline sweep index)')
+    axis.set_xlabel('scene frame (inline/crossline offset)')
     axis.set_ylabel('depth sample')
     axis.legend(loc='upper right', fontsize='small')
   figure.savefig(path, dpi=140)
@@ -335,7 +356,15 @@ def main() -> None:
             config.synthetic, num_frames=args.num_frames
         ),
     )
-    config.validate()
+  config.validate()
+  if (
+      args.frame_stride is not None
+      and args.frame_stride not in config.synthetic.frame_strides
+  ):
+    raise ValueError(
+        f'--frame-stride {args.frame_stride} is not configured for '
+        f'{args.config}: {config.synthetic.frame_strides!r}.'
+    )
   device = train_torch._select_device(args.device)
   model_state, checkpoint_metadata = _load_model_checkpoint(
       args.checkpoint, device
@@ -368,6 +397,9 @@ def main() -> None:
       'trackgroup': [],
       'faulted': [],
       'sweep_reversed': [],
+      'frame_stride': [],
+      'scene_num_frames': [],
+      'frame_indices': [],
   }
   example_seeds = []
   for example_id in range(args.num_examples):
@@ -378,7 +410,7 @@ def main() -> None:
     )
     example_seeds.append(example_seed)
     sample = synthetic.generate_synthetic_sample(
-        config.synthetic, rng=example_seed
+        config.synthetic, rng=example_seed, frame_stride=args.frame_stride
     )
     video = torch.from_numpy(sample['video']).unsqueeze(0).to(device)
     queries = torch.from_numpy(sample['query_points']).unsqueeze(0).to(device)
@@ -411,6 +443,9 @@ def main() -> None:
         'trackgroup',
         'faulted',
         'sweep_reversed',
+        'frame_stride',
+        'scene_num_frames',
+        'frame_indices',
     ):
       sample_key = 'occluded' if key == 'target_occluded' else key
       collected[key].append(np.asarray(sample[sample_key]))
@@ -444,6 +479,8 @@ def main() -> None:
       trackgroup=arrays['trackgroup'],
       faulted=arrays['faulted'],
       sweep_reversed=arrays['sweep_reversed'],
+      frame_strides=arrays['frame_stride'],
+      frame_indices=arrays['frame_indices'],
       visibility_threshold=args.visibility_threshold,
   )
   for example_id in range(args.num_examples):
@@ -455,6 +492,7 @@ def main() -> None:
         target_tracks=arrays['target_tracks'][example_id],
         target_occluded=arrays['target_occluded'][example_id],
         trackability=trackability[example_id],
+        frame_indices=arrays['frame_indices'][example_id],
         visibility_threshold=args.visibility_threshold,
         max_queries=args.queries_per_image,
     )

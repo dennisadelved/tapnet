@@ -50,7 +50,9 @@ def test_intermediate_scalar_format_includes_each_loss_term():
 
 def test_metrics_csv_is_self_describing_and_appendable(tmp_path):
   path = tmp_path / 'metrics.csv'
-  fieldnames = train_torch._metrics_fieldnames(num_stages=2)
+  fieldnames = train_torch._metrics_fieldnames(
+      num_stages=2, include_temporal_stride=True
+  )
   row = {
       'run_id': 'run-a',
       'step': 1,
@@ -74,6 +76,15 @@ def test_metrics_csv_is_self_describing_and_appendable(tmp_path):
   assert 'checkpoint_mode' in rows[0]
   assert 'encoder_learning_rate' in rows[0]
   assert 'peak_cuda_memory_gib' in rows[0]
+  assert 'temporal_stride' in rows[0]
+  assert 'scene_num_frames' in rows[0]
+
+
+def test_legacy_metrics_schema_does_not_gain_multistride_columns():
+  fieldnames = train_torch._metrics_fieldnames(num_stages=2)
+
+  assert 'temporal_stride' not in fieldnames
+  assert 'scene_num_frames' not in fieldnames
 
 
 def test_optimizer_uses_lower_learning_rate_for_encoder_parameters():

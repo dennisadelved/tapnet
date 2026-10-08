@@ -41,6 +41,9 @@ def test_sample_shapes_ranges_and_dtypes():
   assert sample['query_points'].dtype == np.float32
   assert sample['target_points'].dtype == np.float32
   assert sample['occluded'].dtype == np.bool_
+  assert sample['frame_stride'].dtype == np.int32
+  assert sample['scene_num_frames'].dtype == np.int32
+  assert sample['frame_indices'].shape == (config.num_frames,)
   assert np.max(sample['video']) <= 1.0
   assert np.min(sample['video']) >= -1.0
   np.testing.assert_array_equal(sample['video'][..., 0], sample['video'][..., 1])
@@ -118,6 +121,30 @@ def test_seeded_generation_is_reproducible_and_stream_advances():
   assert not np.array_equal(stream_first['video'], stream_second['video'])
 
 
+def test_multistride_views_are_aligned_subsamples_of_one_scene():
+  config = _small_config(frame_strides=(1, 2, 4))
+  views = {
+      stride: generate_synthetic_sample(config, 31, frame_stride=stride)
+      for stride in config.frame_strides
+  }
+
+  assert all(int(view['scene_num_frames']) == 29 for view in views.values())
+  np.testing.assert_array_equal(views[1]['frame_indices'], np.arange(8))
+  np.testing.assert_array_equal(views[2]['frame_indices'], np.arange(8) * 2)
+  np.testing.assert_array_equal(views[4]['frame_indices'], np.arange(8) * 4)
+  np.testing.assert_array_equal(views[1]['video'][::4], views[4]['video'][:2])
+  np.testing.assert_array_equal(views[2]['video'][::2], views[4]['video'][:4])
+
+
+def test_multistride_stream_cycles_balanced_strides():
+  config = _small_config(frame_strides=(1, 2, 4))
+  stream = iter_synthetic_samples(config, seed=37)
+
+  strides = [int(next(stream)['frame_stride']) for _ in range(6)]
+
+  assert strides == [1, 2, 4, 1, 2, 4]
+
+
 @pytest.mark.parametrize(
     'override',
     [
@@ -127,6 +154,9 @@ def test_seeded_generation_is_reproducible_and_stream_advances():
         {'max_faults': 0},
         {'wavelet_length': 16},
         {'fault_probability': 1.1},
+        {'frame_strides': ()},
+        {'frame_strides': (1, 1)},
+        {'frame_strides': (0, 1)},
     ],
 )
 def test_invalid_configuration_is_rejected(override):

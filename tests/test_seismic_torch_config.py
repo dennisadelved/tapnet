@@ -36,6 +36,16 @@ def test_hard_config_extends_temporal_and_fault_curriculum():
   assert config.steps == 5000
 
 
+def test_multistride_config_uses_aligned_32_frame_views():
+  config = torch_config.get_config('vdi-multistride')
+
+  assert config.synthetic.num_frames == 32
+  assert config.synthetic.frame_strides == (1, 2, 4)
+  assert config.synthetic.max_faults == 3
+  assert config.lateral_loss_weight == 1.0
+  assert config.steps == 3000
+
+
 def test_unknown_config_is_rejected():
   with pytest.raises(ValueError, match='Unknown PyTorch config'):
     torch_config.get_config('undocumented')

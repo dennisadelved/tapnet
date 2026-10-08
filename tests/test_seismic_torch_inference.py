@@ -63,6 +63,8 @@ def test_tracks_csv_blanks_position_error_when_target_is_hidden(tmp_path):
       trackgroup=np.array([[7]], dtype=np.int32),
       faulted=np.array([True]),
       sweep_reversed=np.array([False]),
+      frame_strides=np.array([2], dtype=np.int32),
+      frame_indices=np.array([[0, 2]], dtype=np.int32),
       visibility_threshold=0.5,
   )
 
@@ -71,6 +73,8 @@ def test_tracks_csv_blanks_position_error_when_target_is_hidden(tmp_path):
   assert rows[0]['absolute_depth_error'] == '1.0'
   assert rows[0]['query_trackgroup'] == '7'
   assert rows[0]['example_faulted'] == 'True'
+  assert rows[0]['temporal_stride'] == '2'
+  assert rows[1]['scene_frame_index'] == '2'
   assert rows[1]['absolute_depth_error'] == ''
   assert rows[1]['target_visible'] == 'False'
 

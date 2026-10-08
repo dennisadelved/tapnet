@@ -7,7 +7,7 @@ import dataclasses
 from tapnet.seismic.synthetic import SyntheticSeismicConfig
 
 
-CONFIG_VARIANTS = ('smoke', 'vdi-small', 'vdi-hard')
+CONFIG_VARIANTS = ('smoke', 'vdi-small', 'vdi-hard', 'vdi-multistride')
 
 
 @dataclasses.dataclass(frozen=True)
@@ -112,6 +112,30 @@ def get_config(variant: str) -> TorchTrainingConfig:
             termination_probability=0.35,
         ),
         steps=5000,
+        initial_resolution=(128, 128),
+        pyramid_level=1,
+        query_chunk_size=8,
+        warmup_steps=250,
+        learning_rate=5e-5,
+        lateral_loss_weight=1.0,
+    )
+  elif variant == 'vdi-multistride':
+    config = TorchTrainingConfig(
+        synthetic=SyntheticSeismicConfig(
+            num_frames=32,
+            height=128,
+            width=128,
+            num_horizons=10,
+            num_queries=24,
+            wavelet_length=25,
+            noise_std=0.18,
+            max_fault_throw=12.0,
+            fault_probability=1.0,
+            max_faults=3,
+            termination_probability=0.35,
+            frame_strides=(1, 2, 4),
+        ),
+        steps=3000,
         initial_resolution=(128, 128),
         pyramid_level=1,
         query_chunk_size=8,

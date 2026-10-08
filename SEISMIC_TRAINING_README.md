@@ -357,7 +357,7 @@ ZGY smoke was omitted because the current workspace virtual environment lacks
 `pyzgy`. Subsequent VDI baseline and trained runs completed end to end, as
 recorded in the validation section.
 
-`tapnet/seismic/torch_config.py` contains three explicit variants:
+`tapnet/seismic/torch_config.py` contains four explicit variants:
 
 - `smoke`: 64-by-64, 2 frames, 2 queries, one refinement iteration, one step,
   random initialization, and plumbing validation only.
@@ -371,6 +371,9 @@ recorded in the validation section.
   raises fixed-lateral supervision from 0.25 to 1.0 relative to depth. This is
   the second-stage curriculum for the Windows VDI, not a final geological
   simulator.
+- `vdi-multistride`: 128-by-128, 32-frame views sampled at balanced strides
+  1, 2, and 4 from one rendered 125-line scene, otherwise retaining the hard
+  fault/noise/query settings. It plans 3,000 new-optimizer steps.
 
 ### Evaluation
 
@@ -1343,6 +1346,148 @@ signature will correctly reject the mismatch. After training, evaluate the
 same seed with the long checkpoint and then repeat the identical real 400-frame
 forward/cycle test. Promotion requires better 64-frame held-out results and
 lower real cycle/lateral error without degrading forward depth continuity.
+
+### Temporal multi-stride first pass
+
+An alternative to feeding 64 or more consecutive traces is to form three
+aligned views of the same underlying seismic neighborhood. Each view contains
+32 frames, sampled at survey-line strides 1, 2, and 4. Their respective spans
+are 32, 63, and 125 survey lines when both endpoints are counted. This is a
+good fit for the existing TAPIR implementation if the three views are run as
+separate, uniformly sampled sequences. It is not safe to concatenate them into
+one 96-frame sequence: the refinement network applies one-dimensional
+convolutions along the frame axis and is given frame order, but no physical
+survey-line coordinate or frame-spacing value. It would therefore treat a
+one-line step, a two-line step, and a four-line step as identical adjacent
+steps. Duplicate and discontinuously ordered lines would add a second
+ambiguity.
+
+There is room for the separate-view approach without changing pretrained model
+weights. The feature encoder operates on frames independently, the initial
+cost volume matches the query feature against every frame, and the model accepts
+a variable number of frames. The existing `pyramid_level` setting is an image
+height/width feature pyramid and must not be confused with temporal or
+survey-line stride. Temporal coupling happens later in the PIPs mixer, so each
+individual view must retain monotonic, constant survey-line spacing.
+
+The recommended first prototype is deliberately outside the TAPIR core:
+
+1. Generate one high-resolution synthetic scene covering at least 125 lines.
+2. Derive the stride-1, stride-2, and stride-4 views from that same rendered
+   scene, including targets, visibility, query-frame remapping, and a shared
+   amplitude normalization scale.
+3. During training, select one of the three strides per example with a balanced
+   distribution. This exposes the unchanged model to all scales while keeping
+   memory close to one 32-frame run. Do not hold three backward graphs in memory.
+4. During inference, run the three views separately and map every prediction
+   back to its actual survey-line index. At lines shared by multiple views,
+   measure scale disagreement before any fusion.
+5. Use a coarse prediction as an anchor for a consecutive-trace local window,
+   then obtain the final dense track from the local window. Confidence-weighted
+   averaging alone is not sufficient because the 400-frame experiment showed
+   that high apparent trackability can coexist with poor lateral cycle return.
+
+A minimal fusion rule should prefer the consecutive-trace result where it
+exists, use the sparse view to extend coverage, and reject or flag locations
+where depth, lateral position, polarity, or forward/backward cycle checks
+disagree. A robust median or confidence-weighted depth estimate can be tested
+only at overlapping physical lines; lateral identity should not be averaged
+across clearly different events. Near faults, stride 4 can skip the transition
+entirely, so cross-scale disagreement is useful evidence rather than noise to
+smooth away.
+
+This design does not by itself cover a 400-line sweep. A 32-frame stride-4 view
+spans only 125 lines. Full coverage still requires overlapping coarse windows,
+a larger stride, or hierarchical reseeding. The first experiment should stop at
+125 lines so the effect of scale can be isolated before adding window stitching.
+
+The first training-side implementation is `--config vdi-multistride`. The
+generator renders one 125-line scene and then extracts one 32-frame view at
+stride 1, 2, or 4. Strides cycle exactly in that order, remain deterministic
+across resume, and are recorded as `temporal_stride` in every metrics row.
+`scene_num_frames` and the exact physical `frame_indices` are retained in the
+generated sample. All views from a forced common seed share the same geology
+and amplitude normalization.
+
+The first pass deliberately does not yet change the TAPIR core, run all three
+views in one training step, fuse predictions, add a consistency loss, or read
+strided real-ZGY lines. The real ZGY readers still provide consecutive lines;
+the multi-stride checkpoint can be tested on them as a stride-1 input after
+the synthetic gates pass.
+
+Use the hard 5,000-step checkpoint as the preferred initialization when it is
+available. Otherwise the official BootsTAPIR checkpoint is a valid plumbing
+fallback, but it does not isolate the effect of multi-stride training from the
+earlier seismic curriculum.
+
+Run a one-step CUDA gate first:
+
+```powershell
+$python = 'C:\Users\adelv\Documents\venvs\seismic-pytorch\Scripts\python.exe'
+$sourceCheckpoint = 'checkpoints\seismic_tapir_torch_vdi_hard5000\latest.pt'
+$smokeOutput = 'checkpoints\seismic_tapir_torch_vdi_multistride_smoke1'
+
+& $python -m tapnet.seismic.train_torch `
+  --config vdi-multistride `
+  --steps 1 `
+  --device cuda `
+  --pretrained-checkpoint $sourceCheckpoint `
+  --output-dir $smokeOutput `
+  --checkpoint-every 1 `
+  --checkpoint-mode model-only
+```
+
+Confirm a finite loss, `feature_encoder=frozen`, `precision=bfloat16`, and safe
+peak CUDA memory. Then start the 3,000-step run with a new optimizer:
+
+```powershell
+$multiOutput = 'checkpoints\seismic_tapir_torch_vdi_multistride3000'
+
+& $python -m tapnet.seismic.train_torch `
+  --config vdi-multistride `
+  --steps 3000 `
+  --device cuda `
+  --pretrained-checkpoint $sourceCheckpoint `
+  --output-dir $multiOutput `
+  --checkpoint-every 500
+```
+
+Resume without changing the config or total-step target:
+
+```powershell
+& $python -m tapnet.seismic.train_torch `
+  --config vdi-multistride `
+  --steps 3000 `
+  --device cuda `
+  --resume "$multiOutput\latest.pt" `
+  --output-dir $multiOutput `
+  --checkpoint-every 500
+```
+
+Evaluate each stride separately on the same untouched seed:
+
+```powershell
+foreach ($stride in 1, 2, 4) {
+  & $python -m tapnet.seismic.infer_torch `
+    --checkpoint "$multiOutput\latest.pt" `
+    --config vdi-multistride `
+    --frame-stride $stride `
+    --output-dir "${multiOutput}_eval_stride${stride}_seed4000000" `
+    --num-examples 32 `
+    --seed 4000000 `
+    --device cuda
+}
+```
+
+Before promotion, compare three controlled variants on identical held-out scene
+seeds: the existing consecutive-frame model, a model trained with balanced
+random stride, and three-view inference using that model. Report results
+separately for strides 1, 2, and 4 in actual survey-line units, split depth and
+lateral errors by distance to a fault, record cross-scale disagreement, and
+repeat the real forward/backward cycle test. The multi-stride prototype succeeds
+only if it reduces long-range lateral cycle error without degrading dense
+stride-1 depth continuity. GPU headroom is not the deciding constraint for this
+prototype; identity preservation across scales is.
 
 Run a real seeded-track smoke after choosing a visible reflector in a seismic
 viewer. Annotation mode expects the actual inline number, crossline number, and

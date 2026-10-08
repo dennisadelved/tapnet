@@ -252,7 +252,9 @@ def _format_intermediate_scalars(
   return ' '.join(fields)
 
 
-def _metrics_fieldnames(num_stages: int) -> list[str]:
+def _metrics_fieldnames(
+    num_stages: int, *, include_temporal_stride: bool = False
+) -> list[str]:
   """Returns the stable, self-contained training CSV schema."""
   fields = [
       'run_id',
@@ -285,6 +287,9 @@ def _metrics_fieldnames(num_stages: int) -> list[str]:
       'probability_loss',
       'intermediate_loss',
   ]
+  if include_temporal_stride:
+    insertion = fields.index('elapsed_seconds')
+    fields[insertion:insertion] = ['temporal_stride', 'scene_num_frames']
   for index in range(num_stages):
     fields.extend(
         (
@@ -615,7 +620,11 @@ def main() -> None:
       lateral_loss_weight=config.lateral_loss_weight
   )
   metrics_path = output_dir / 'metrics.csv'
-  metric_fieldnames = _metrics_fieldnames(config.num_pips_iter)
+  include_temporal_stride = len(config.synthetic.frame_strides) > 1
+  metric_fieldnames = _metrics_fieldnames(
+      config.num_pips_iter,
+      include_temporal_stride=include_temporal_stride,
+  )
   _prepare_metrics_csv(metrics_path, metric_fieldnames)
   print(f'metrics_csv={metrics_path}')
   run_id = datetime.datetime.now(datetime.timezone.utc).strftime(
@@ -715,6 +724,11 @@ def main() -> None:
             name: float(scalars[name].detach()) for name in summary_names
         },
     }
+    if include_temporal_stride:
+      metric_row.update({
+          'temporal_stride': int(batch['frame_stride'].item()),
+          'scene_num_frames': int(batch['scene_num_frames'].item()),
+      })
     for index in range(config.num_pips_iter):
       metric_row.update(
           {
