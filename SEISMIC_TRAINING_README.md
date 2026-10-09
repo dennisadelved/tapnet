@@ -65,6 +65,9 @@ The paper-inspired geological suite in `tapnet/seismic/geology.py` adds paired
 3D seismic/RGT, structural masks, erosion, clinoforms, and seven balanced
 geological scenarios. It feeds the same TAPIR labels into the native PyTorch
 trainer with `--config vdi-geology`; `geology-smoke` is the CPU sanity check.
+`vdi-geology` generates full 256-cubed source volumes, uses 64-frame 256-by-256
+views at strides 1/2/4, and sets an 80-sample nominal throw budget. Wu's curved
+fault maps retain coherent geology on both sides of each fault.
 It also exports reproducible whole-scene train/validation/test NPZ splits.
 Commands, label policy, and approximation limits are documented in
 [docs/SYNTHETIC_SEISMIC_SUITE.md](docs/SYNTHETIC_SEISMIC_SUITE.md). Existing
@@ -2026,9 +2029,11 @@ These omissions are material and must not be inferred as implemented:
    anisotropic sampling, or elastic effects.
 6. **Simplified faults and terminations.** Legacy configs use shared fault
    throw and planar termination masks. The geological suite adds erosion-based
-   unconformities, depositional fronts, and paired RGT labels; fault cores/damage
-   masks are supported. Fault drag, growth faults, reverse-fault repetitions,
-   overturned strata, and ambiguous cross-fault correlation remain absent.
+   unconformities, depositional fronts, and paired RGT labels. The geological
+   suite now uses Wu's curved dipping faults, finite slip, drag, and reverse-fault
+   repetitions; fault masks label structures without deleting amplitudes.
+   Repeated age intersections are excluded from point losses. Growth faults,
+   mechanical deformation, and branch-aware overturned-strata tracking remain absent.
 7. **No hard lateral constraint.** Lateral drift is penalized but TAPIR can still
    predict it. Masking the cost volume to a vertical corridor or replacing the
    2D head with a 1D depth head has not been tested.

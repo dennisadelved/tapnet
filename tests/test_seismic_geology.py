@@ -1,5 +1,6 @@
 """Geological topology, label alignment, split isolation, and reproducibility."""
 
+import dataclasses
 import json
 
 import numpy as np
@@ -8,6 +9,7 @@ import pytest
 from tapnet.seismic import geology
 from tapnet.seismic import generate_suite
 from tapnet.seismic import synthetic
+from tapnet.seismic import structure
 
 
 def _config(**overrides):
@@ -29,7 +31,8 @@ def test_volume_topology_and_labels_come_from_the_same_stratigraphy(scenario):
   assert np.isfinite(rgt).all()
   assert np.min(rgt) == pytest.approx(-1)
   assert np.max(rgt) == pytest.approx(1)
-  assert np.all(np.diff(rgt, axis=1) > 0)
+  continuous = ~volume['fault_discontinuity_mask'][:, 1:]
+  assert np.all(np.diff(rgt, axis=1)[continuous] > 0)
   assert np.all(np.diff(volume['horizon_rgt']) > 0)
   assert volume['seismic'].dtype == np.float32
   assert np.isfinite(volume['seismic']).all()
@@ -76,17 +79,20 @@ def test_tap_tracks_match_volume_after_reversal_and_stride(reverse_probability, 
   np.testing.assert_array_equal(sample['frame_indices'], 24 + (np.arange(12) - 6) * stride)
   assert int(sample['scene_num_frames']) == 45
   assert bool(sample['sweep_reversed']) == bool(reverse_probability)
-  assert sample['label_valid'].all()
   for index, (frame, depth, lateral) in enumerate(sample['query_points']):
     frame, lateral = int(frame), int(lateral)
     horizon = sample['trackgroup'][index]
     assert not sample['occluded'][index, frame]
+    assert sample['label_valid'][index, frame]
     np.testing.assert_array_equal(
         sample['target_points'][index, :, 1],
         sample['horizon_depths'][horizon, :, lateral],
     )
     np.testing.assert_array_equal(
         ~sample['occluded'][index], sample['horizon_visible'][horizon, :, lateral]
+    )
+    np.testing.assert_array_equal(
+        sample['label_valid'][index], sample['horizon_valid'][horizon, :, lateral]
     )
     np.testing.assert_array_equal(sample['target_points'][index, :, 0], lateral)
     np.testing.assert_array_equal(sample['target_points'][index, frame], [lateral, depth])
@@ -133,8 +139,10 @@ def test_rendering_accepts_absent_horizons_at_last_depth_sample():
     {'scenarios': ()}, {'scenarios': ('invalid',)},
     {'scenarios': ('layered', 'layered')}, {'noise_std': -1},
     {'noise_std': float('nan')}, {'max_fault_throw': float('inf')},
-    {'max_fault_throw': 48}, {'max_faults': 0}, {'fault_damage_width': -1},
-    {'fault_damage_width': 6},
+    {'max_fault_throw': 48}, {'max_faults': 0}, {'fault_label_width': -1},
+    {'generator_version': 1},
+    {'scene_num_frames': 10}, {'scene_num_frames': 12.5},
+    {'scene_num_frames': True}, {'scene_num_frames': 44, 'frame_strides': (1, 2, 4)},
     {'reverse_probability': 2}, {'frame_strides': (1, 1)},
     {'frame_strides': (1.5,)}, {'num_horizons': 2.5},
 ))
@@ -161,6 +169,8 @@ def test_export_is_reproducible_split_isolated_and_pickle_free(tmp_path):
                               validation_samples=1, test_samples=1, seed=2)
   manifest = json.loads((first / 'manifest.json').read_text())
   assert manifest['split_counts'] == {'train': 4, 'validation': 1, 'test': 1}
+  assert manifest['format_version'] == 2
+  assert manifest['config']['generator_version'] == 2
   records = manifest['samples']
   assert len({r['seed'] for r in records}) == len(records)
   assert [(r['scenario'], r['frame_stride']) for r in records[:4]] == [
@@ -183,3 +193,99 @@ def test_invalid_export_leaves_no_output_directory(tmp_path):
     with pytest.raises(ValueError):
       generate_suite.export_suite(destination, _config(), **overrides)
     assert not destination.exists()
+
+
+def test_reverse_fault_repetitions_are_ambiguous_and_jumps_are_not_horizons():
+  rgt = np.array([0, 1, 2, 0, 1, 2], np.float32)[None, :, None]
+  jumps = np.zeros_like(rgt, dtype=bool)
+  jumps[:, 3] = True
+  depths, visible, valid, count = geology._extract_horizons(
+      rgt, [0.5, 1.5, 2.5], jumps, np.zeros_like(jumps)
+  )
+  np.testing.assert_array_equal(count[:, 0, 0], [2, 2, 0])
+  np.testing.assert_array_equal(visible[:, 0, 0], [True, True, False])
+  np.testing.assert_array_equal(valid[:, 0, 0], [False, False, True])
+  np.testing.assert_allclose(depths[:2, 0, 0], [0.5, 1.5])
+  rgt = np.array([0, 0.2, 0.8, 1], np.float32)[None, :, None]
+  jumps = np.zeros_like(rgt, dtype=bool)
+  jumps[:, 2] = True
+  _, visible, _, _ = geology._extract_horizons(rgt, [0.5], jumps, np.zeros_like(jumps))
+  assert not visible.any()
+
+
+def test_fault_segmentation_width_never_erases_reflectivity_or_targets():
+  thin = geology.generate_geological_volume(_config(fault_label_width=0), 6, scenario='faulted')
+  wide = geology.generate_geological_volume(_config(fault_label_width=5), 6, scenario='faulted')
+  assert wide['fault_mask'].sum() > thin['fault_mask'].sum()
+  for key in ('seismic', 'reflectivity', 'rgt', 'horizon_depths',
+              'horizon_visible', 'horizon_valid'):
+    np.testing.assert_array_equal(thin[key], wide[key])
+  assert np.count_nonzero(wide['reflectivity'][wide['fault_mask']]) > 100
+  assert np.mean(wide['seismic'][wide['fault_mask']]**2) > 0.01
+
+
+@pytest.mark.parametrize('scenario', ('layered', 'folded', 'faulted'))
+def test_shared_material_reflectivity_is_convolved_after_structural_deformation(scenario):
+  config = _config(noise_std=0)
+  volume = geology.generate_geological_volume(config, 6, scenario=scenario)
+  age_scale = np.diff(volume['age_bounds'])[0] / 2
+  expected = sum(coefficient * np.maximum(1 - abs(volume['rgt'] - age) * age_scale, 0)
+                 for age, coefficient in zip(volume['horizon_rgt'], volume['horizon_reflectivity']))
+  np.testing.assert_allclose(volume['reflectivity'], expected, atol=1e-7)
+  expected = synthetic._convolve_depth(expected, volume['wavelet'])
+  expected *= volume['depth_gain'][None, :, None]
+  expected = np.clip(expected / volume['amplitude_scale'], -1, 1)
+  np.testing.assert_allclose(volume['seismic'], expected, atol=2e-7)
+
+
+def test_generated_reverse_faults_keep_reflectors_but_exclude_ambiguous_track_labels():
+  config = _config(num_horizons=40, num_queries=256, max_faults=1, max_fault_throw=30,
+                   reverse_probability=0)
+  sample = geology.generate_geological_sample(config, 0, scenario='faulted', include_volume=True)
+  assert sample['fault_parameters'][0, 5] < 0
+  assert np.any(sample['horizon_root_count'] > 1)
+  assert np.any(~sample['label_valid'])
+  assert sample['horizon_visible'][~sample['horizon_valid']].all()
+  assert not sample['occluded'][~sample['label_valid']].any()
+
+
+def test_large_source_cube_views_match_full_geology_after_reversal_and_stride():
+  config = _config(num_frames=8, scene_num_frames=64, frame_strides=(1, 2, 4),
+                   reverse_probability=1)
+  source_config = dataclasses.replace(
+      config, num_frames=64, scene_num_frames=None, frame_strides=(1,)
+  )
+  full = geology.generate_geological_volume(source_config, 3, scenario='mixed')
+  for stride in config.frame_strides:
+    sample = geology.generate_geological_sample(
+        config, 3, scenario='mixed', frame_stride=stride, include_volume=True
+    )
+    indices = 32 + (np.arange(8) - 4) * stride
+    assert int(sample['scene_num_frames']) == 64
+    np.testing.assert_array_equal(sample['frame_indices'], indices)
+    for key in ('seismic', 'reflectivity', 'rgt', 'fault_mask', 'unconformity_mask'):
+      np.testing.assert_array_equal(sample[key], full[key][::-1][indices])
+    for key in ('horizon_depths', 'horizon_visible', 'horizon_valid'):
+      np.testing.assert_array_equal(sample[key], full[key][:, ::-1][:, indices])
+
+
+def test_slabbed_structure_matches_whole_volume_restoration_without_fault_seams():
+  config = _config(num_frames=40, max_faults=1, fault_label_width=0)
+  volume = geology.generate_geological_volume(config, 3, scenario='faulted')
+  rng = np.random.default_rng(3)
+  dip, folds = structure.sample_fold(config.height, 'faulted', rng)
+  fault = structure.sample_faults(config.height, 1, config.max_fault_throw, rng)[0]
+  extent = config.height - 1
+  coordinates = (
+      np.linspace(-extent / 2, extent / 2, 40)[:, None, None],
+      np.linspace(-extent / 2, extent / 2, config.width)[None, None, :],
+      np.arange(config.height)[None, :, None],
+  )
+  age = structure.restore_fold(fault.restore(coordinates), config.height, dip, folds)
+  bounds = volume['age_bounds']
+  expected_rgt = (2 * (age - bounds[0]) / np.diff(bounds)[0] - 1).astype(np.float32)
+  np.testing.assert_allclose(volume['rgt'], expected_rgt, atol=2e-7)
+  distance, active = fault.fault_coordinates(coordinates)
+  crossings = ((distance[:-1] >= 0) != (distance[1:] >= 0)) & (active[:-1] | active[1:])
+  assert crossings.any()
+  assert volume['fault_mask'][1:][crossings].all()

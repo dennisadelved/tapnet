@@ -23,6 +23,19 @@ def test_training_cli_accepts_temporal_length_override(monkeypatch):
   assert args.num_frames == 64
 
 
+def test_training_cli_accepts_single_stride_override(monkeypatch):
+  monkeypatch.setattr(sys, 'argv', ['train_torch', '--config', 'vdi-geology',
+                                   '--frame-stride', '1'])
+  assert train_torch._parse_args().frame_stride == 1
+
+
+@pytest.mark.parametrize('stride', ('0', '-1'))
+def test_training_cli_rejects_nonpositive_stride(monkeypatch, stride):
+  monkeypatch.setattr(sys, 'argv', ['train_torch', '--frame-stride', stride])
+  with pytest.raises(SystemExit):
+    train_torch._parse_args()
+
+
 def test_nonfinite_gradient_is_rejected_before_optimizer_step():
   model = torch.nn.Linear(1, 1)
   for parameter in model.parameters():

@@ -501,7 +501,8 @@ def main() -> None:
         query_points=arrays['query_points'][example_id],
         predicted_tracks=arrays['predicted_tracks'][example_id],
         target_tracks=arrays['target_tracks'][example_id],
-        target_occluded=arrays['target_occluded'][example_id],
+        target_occluded=(arrays['target_occluded'][example_id]
+                         | ~arrays['label_valid'][example_id]),
         trackability=trackability[example_id],
         frame_indices=arrays['frame_indices'][example_id],
         visibility_threshold=args.visibility_threshold,

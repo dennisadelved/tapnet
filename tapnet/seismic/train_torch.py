@@ -32,6 +32,8 @@ def _parse_args() -> argparse.Namespace:
       '--config', choices=torch_config.CONFIG_VARIANTS, default='smoke'
   )
   parser.add_argument('--steps', type=int, default=None)
+  parser.add_argument('--frame-stride', type=int, default=None,
+                      help='Train with one survey-line stride instead of the configured mix.')
   parser.add_argument(
       '--num-frames',
       type=int,
@@ -81,6 +83,8 @@ def _parse_args() -> argparse.Namespace:
     parser.error('--steps must be positive.')
   if args.num_frames is not None and args.num_frames < 2:
     parser.error('--num-frames must be at least 2 when supplied.')
+  if args.frame_stride is not None and args.frame_stride < 1:
+    parser.error('--frame-stride must be positive.')
   if args.checkpoint_every < 1:
     parser.error('--checkpoint-every must be positive.')
   if args.encoder_lr_multiplier is not None and not (
@@ -478,6 +482,12 @@ def main() -> None:
   config = torch_config.get_config(args.config)
   if args.steps is not None:
     config = dataclasses.replace(config, steps=args.steps)
+  if args.frame_stride is not None:
+    config = dataclasses.replace(
+        config, synthetic=dataclasses.replace(
+            config.synthetic, frame_strides=(args.frame_stride,)
+        ),
+    )
   if args.num_frames is not None:
     config = dataclasses.replace(
         config,

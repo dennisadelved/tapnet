@@ -78,7 +78,11 @@ def test_geology_training_config_uses_all_scenarios_and_multiple_strides():
   assert isinstance(config.synthetic, geology.GeologicalSeismicConfig)
   assert config.synthetic.scenarios == geology.SCENARIOS
   assert config.synthetic.frame_strides == (1, 2, 4)
-  assert config.initial_resolution == (128, 128)
+  assert config.synthetic.num_frames == 64
+  assert config.synthetic.scene_num_frames == 256
+  assert config.synthetic.max_fault_throw == 80
+  assert config.initial_resolution == (256, 256)
+  assert config.query_chunk_size == 4
   assert config.steps == 5000
 
 

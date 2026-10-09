@@ -193,7 +193,7 @@ def get_config(variant: str) -> TorchTrainingConfig:
             num_queries=2,
             wavelet_length=17,
             max_fault_throw=4.0,
-            fault_damage_width=0,
+            fault_label_width=0,
         ),
         steps=1,
         initial_resolution=(64, 64),
@@ -203,11 +203,13 @@ def get_config(variant: str) -> TorchTrainingConfig:
     )
   elif variant == 'vdi-geology':
     config = TorchTrainingConfig(
-        synthetic=GeologicalSeismicConfig(frame_strides=(1, 2, 4)),
+        synthetic=GeologicalSeismicConfig(
+            num_frames=64, scene_num_frames=256, frame_strides=(1, 2, 4)
+        ),
         steps=5000,
-        initial_resolution=(128, 128),
+        initial_resolution=(256, 256),
         pyramid_level=1,
-        query_chunk_size=8,
+        query_chunk_size=4,
         warmup_steps=250,
         learning_rate=5e-5,
         lateral_loss_weight=1.0,

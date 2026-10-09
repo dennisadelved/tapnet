@@ -10,6 +10,7 @@ from pathlib import Path
 import numpy as np
 
 from tapnet.seismic import geology
+from tapnet.seismic import structure
 
 
 def export_suite(
@@ -61,11 +62,14 @@ def export_suite(
           'seed': sample_seed, 'scenario': scenario, 'frame_stride': stride,
       })
   manifest = {
-      'format_version': 1,
+      'format_version': 2,
       'generator': 'tapnet.seismic.geology',
       'numpy_version': np.__version__,
-      'reference': 'https://arxiv.org/abs/2605.01273',
-      'method': 'paper-inspired stratigraphic deformation and Ricker convolution',
+      'reference': 'https://doi.org/10.1190/geo2019-0375.1',
+      'suite_reference': 'https://arxiv.org/abs/2605.01273',
+      'method': 'Wu folding and curved dip-slip maps, then Ricker convolution',
+      'fault_parameter_names': structure.FAULT_PARAMETER_NAMES,
+      'fault_surface_control_order': ['normalized_strike', 'normalized_dip', 'normal_offset'],
       'axis_order': ['frame', 'depth', 'lateral'],
       'query_order': ['frame', 'depth', 'lateral'],
       'target_order': ['lateral', 'depth'],
@@ -88,23 +92,29 @@ def main() -> None:
   parser.add_argument('--validation-samples', type=int, default=14)
   parser.add_argument('--test-samples', type=int, default=14)
   parser.add_argument('--seed', type=int, default=0)
-  parser.add_argument('--frames', type=int, default=32)
-  parser.add_argument('--height', type=int, default=128)
-  parser.add_argument('--width', type=int, default=128)
+  parser.add_argument('--frames', type=int, default=256,
+                      help='Frames exported per sample (256 gives a full cube at stride 1).')
+  parser.add_argument('--scene-frames', type=int,
+                      help='Source volume frames, independent of exported view length.')
+  parser.add_argument('--height', type=int, default=256)
+  parser.add_argument('--width', type=int, default=256)
   parser.add_argument('--horizons', type=int, default=20)
   parser.add_argument('--queries', type=int, default=24)
   parser.add_argument('--noise-std', type=float, default=0.12)
-  parser.add_argument('--max-fault-throw', type=float, default=20.0)
+  parser.add_argument('--max-fault-throw', type=float, default=80.0)
   parser.add_argument('--max-faults', type=int, default=3)
+  parser.add_argument('--fault-label-width', type=int, default=1)
   parser.add_argument('--frame-strides', type=int, nargs='+', default=[1])
   parser.add_argument('--scenarios', choices=geology.SCENARIOS, nargs='+',
                       default=list(geology.SCENARIOS))
   args = parser.parse_args()
   config = geology.GeologicalSeismicConfig(
       num_frames=args.frames, height=args.height, width=args.width,
+      scene_num_frames=args.scene_frames,
       num_horizons=args.horizons, num_queries=args.queries,
       noise_std=args.noise_std, max_fault_throw=args.max_fault_throw,
       max_faults=args.max_faults, frame_strides=tuple(args.frame_strides),
+      fault_label_width=args.fault_label_width,
       scenarios=tuple(args.scenarios),
   )
   try:
