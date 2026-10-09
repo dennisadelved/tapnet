@@ -30,12 +30,19 @@ class SyntheticSeismicConfig:
   min_wavelet_frequency: float = 0.06
   max_wavelet_frequency: float = 0.14
   noise_std: float = 0.12
+  min_fault_throw: float = 0.0
   max_fault_throw: float = 12.0
   fault_probability: float = 0.7
   max_faults: int = 1
+  max_fault_offset: float = 0.45
+  divide_fault_throw_by_count: bool = True
+  min_fault_damage_width: int = 0
+  max_fault_damage_width: int = 0
+  fault_query_probability: float = 0.0
   termination_probability: float = 0.25
   reverse_probability: float = 0.5
   frame_strides: tuple[int, ...] = (1,)
+  center_aligned_views: bool = False
 
   def validate(self) -> None:
     """Raises ``ValueError`` when dimensions cannot make valid examples."""
@@ -49,6 +56,26 @@ class SyntheticSeismicConfig:
       raise ValueError('num_queries must be positive.')
     if self.max_faults < 1:
       raise ValueError('max_faults must be positive.')
+    if not 0.0 <= self.min_fault_throw <= self.max_fault_throw:
+      raise ValueError(
+          'Fault throws must satisfy 0 <= min_fault_throw <= '
+          'max_fault_throw.'
+      )
+    if not 0.0 <= self.max_fault_offset < 1.0:
+      raise ValueError('max_fault_offset must be in [0, 1).')
+    if (
+        self.divide_fault_throw_by_count
+        and self.min_fault_throw * self.max_faults > self.max_fault_throw
+    ):
+      raise ValueError(
+          'min_fault_throw is incompatible with divided multi-fault throws.'
+      )
+    if not (
+        0 <= self.min_fault_damage_width <= self.max_fault_damage_width
+    ):
+      raise ValueError(
+          'Fault damage widths must satisfy 0 <= min <= max.'
+      )
     if not self.frame_strides:
       raise ValueError('frame_strides must not be empty.')
     if any(stride < 1 for stride in self.frame_strides):
@@ -61,6 +88,7 @@ class SyntheticSeismicConfig:
       raise ValueError('Wavelet frequencies must satisfy 0 < min < max < 0.5.')
     for name in (
         'fault_probability',
+        'fault_query_probability',
         'termination_probability',
         'reverse_probability',
     ):
@@ -105,10 +133,10 @@ def _convolve_depth(reflectivity: np.ndarray, wavelet: np.ndarray) -> np.ndarray
   return convolved[:, start:stop].astype(np.float32)
 
 
-def _make_horizons(
+def _make_horizons_and_damage(
     config: SyntheticSeismicConfig, rng: np.random.Generator
-) -> tuple[np.ndarray, np.ndarray, int]:
-  """Returns depth surfaces, visibility masks, and generated fault count."""
+) -> tuple[np.ndarray, np.ndarray, int, np.ndarray]:
+  """Returns surfaces, visibility, fault count, and the fault-core mask."""
   frame = np.linspace(-1.0, 1.0, config.num_frames, dtype=np.float32)
   lateral = np.linspace(-1.0, 1.0, config.width, dtype=np.float32)
   frame_grid, lateral_grid = np.meshgrid(frame, lateral, indexing='ij')
@@ -122,6 +150,7 @@ def _make_horizons(
       + rng.uniform(-1.0, 1.0) * lateral_grid
   )
   shared_structure = dip + cross_dip + curvature + fold
+  fault_damage = np.zeros(frame_grid.shape, dtype=bool)
 
   fault_count = 0
   if rng.random() < config.fault_probability:
@@ -132,13 +161,34 @@ def _make_horizons(
     )
   for _ in range(fault_count):
     fault_slope = rng.uniform(-0.7, 0.7)
-    fault_offset = rng.uniform(-0.45, 0.45)
-    fault_side = frame_grid - fault_slope * lateral_grid > fault_offset
-    fault_throw = rng.uniform(
-        -config.max_fault_throw / fault_count,
-        config.max_fault_throw / fault_count,
+    fault_offset = rng.uniform(-config.max_fault_offset, config.max_fault_offset)
+    signed_fault_distance = (
+        frame_grid - fault_slope * lateral_grid - fault_offset
     )
+    fault_side = signed_fault_distance > 0.0
+    throw_limit = (
+        config.max_fault_throw / fault_count
+        if config.divide_fault_throw_by_count
+        else config.max_fault_throw
+    )
+    if config.min_fault_throw == 0.0:
+      fault_throw = rng.uniform(-throw_limit, throw_limit)
+    else:
+      throw_magnitude = rng.uniform(config.min_fault_throw, throw_limit)
+      fault_throw = throw_magnitude * rng.choice((-1.0, 1.0))
     shared_structure = shared_structure + fault_side * fault_throw
+    if config.max_fault_damage_width > 0:
+      damage_width = int(rng.integers(
+          config.min_fault_damage_width,
+          config.max_fault_damage_width + 1,
+      ))
+      if damage_width > 0:
+        half_width_normalized = damage_width / max(
+            config.num_frames - 1, 1
+        )
+        fault_damage |= (
+            np.abs(signed_fault_distance) <= half_width_normalized
+        )
 
   margin = _depth_margin(config)
   bases = np.linspace(
@@ -173,7 +223,17 @@ def _make_horizons(
     else:
       visibility[horizon_index] = boundary >= 0.0
 
-  return surface_array, visibility, fault_count
+  visibility &= ~fault_damage[None, :, :]
+
+  return surface_array, visibility, fault_count, fault_damage
+
+
+def _make_horizons(
+    config: SyntheticSeismicConfig, rng: np.random.Generator
+) -> tuple[np.ndarray, np.ndarray, int]:
+  """Returns depth surfaces, visibility masks, and generated fault count."""
+  surfaces, visibility, fault_count, _ = _make_horizons_and_damage(config, rng)
+  return surfaces, visibility, fault_count
 
 
 def _render_amplitudes(
@@ -249,13 +309,39 @@ def _sample_tracks(
     visibility: np.ndarray,
     config: SyntheticSeismicConfig,
     rng: np.random.Generator,
+    fault_damage: np.ndarray | None = None,
 ) -> Mapping[str, np.ndarray]:
   valid_pairs = np.argwhere(np.any(visibility, axis=1))
   if valid_pairs.size == 0:
     raise RuntimeError('No visible horizon/lateral pair was generated.')
-  selected_pairs = valid_pairs[
-      rng.integers(0, len(valid_pairs), size=config.num_queries)
-  ]
+  if config.fault_query_probability > 0.0 and fault_damage is not None:
+    crossing_pairs = []
+    for horizon_id, lateral_position in valid_pairs:
+      damaged_frames = np.flatnonzero(fault_damage[:, lateral_position])
+      if damaged_frames.size == 0:
+        continue
+      track_visibility = visibility[horizon_id, :, lateral_position]
+      if (
+          np.any(track_visibility[:damaged_frames[0]])
+          and np.any(track_visibility[damaged_frames[-1] + 1:])
+      ):
+        crossing_pairs.append((horizon_id, lateral_position))
+    crossing_pairs = np.asarray(crossing_pairs, dtype=np.int32)
+  else:
+    crossing_pairs = np.empty((0, 2), dtype=np.int32)
+  if crossing_pairs.size:
+    selected_pairs = np.asarray([
+        (
+            crossing_pairs[rng.integers(0, len(crossing_pairs))]
+            if rng.random() < config.fault_query_probability
+            else valid_pairs[rng.integers(0, len(valid_pairs))]
+        )
+        for _ in range(config.num_queries)
+    ])
+  else:
+    selected_pairs = valid_pairs[
+        rng.integers(0, len(valid_pairs), size=config.num_queries)
+    ]
   horizon_ids = selected_pairs[:, 0].astype(np.int32)
   lateral_positions = selected_pairs[:, 1].astype(np.int32)
   query_points = np.empty((config.num_queries, 3), dtype=np.float32)
@@ -325,22 +411,35 @@ def generate_synthetic_sample(
   scene_config = dataclasses.replace(
       config, num_frames=scene_num_frames, frame_strides=(1,)
   )
-  surfaces, visibility, fault_count = _make_horizons(scene_config, rng)
+  surfaces, visibility, fault_count, fault_damage = (
+      _make_horizons_and_damage(scene_config, rng)
+  )
   reversed_sweep = bool(rng.random() < config.reverse_probability)
   if reversed_sweep:
     surfaces = surfaces[:, ::-1]
     visibility = visibility[:, ::-1]
+    fault_damage = fault_damage[::-1]
 
   amplitudes = _render_amplitudes(surfaces, visibility, scene_config, rng)
   if frame_stride is None:
     frame_stride = int(rng.choice(config.frame_strides))
-  frame_indices = (
-      np.arange(config.num_frames, dtype=np.int32) * frame_stride
-  )
+  if config.center_aligned_views:
+    center = (config.num_frames // 2) * max(config.frame_strides)
+    frame_indices = center + (
+        np.arange(config.num_frames, dtype=np.int32)
+        - config.num_frames // 2
+    ) * frame_stride
+  else:
+    frame_indices = (
+        np.arange(config.num_frames, dtype=np.int32) * frame_stride
+    )
   surfaces = surfaces[:, frame_indices]
   visibility = visibility[:, frame_indices]
+  fault_damage = fault_damage[frame_indices]
   amplitudes = amplitudes[frame_indices]
-  tracks = _sample_tracks(surfaces, visibility, config, rng)
+  tracks = _sample_tracks(
+      surfaces, visibility, config, rng, fault_damage=fault_damage
+  )
   video = np.repeat(amplitudes[..., None], 3, axis=-1)
 
   return {

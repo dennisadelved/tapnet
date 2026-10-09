@@ -46,6 +46,26 @@ def test_multistride_config_uses_aligned_32_frame_views():
   assert config.steps == 3000
 
 
+def test_fault_robust_config_expands_depth_and_fault_curriculum():
+  config = torch_config.get_config('vdi-fault-robust')
+
+  assert config.synthetic.num_frames == 32
+  assert config.synthetic.frame_strides == (1, 2, 4)
+  assert config.synthetic.height == 256
+  assert config.synthetic.width == 128
+  assert config.synthetic.min_fault_throw == 4.0
+  assert config.synthetic.max_fault_throw == 80.0
+  assert config.synthetic.max_fault_offset == 0.15
+  assert not config.synthetic.divide_fault_throw_by_count
+  assert config.synthetic.min_fault_damage_width == 1
+  assert config.synthetic.max_fault_damage_width == 8
+  assert config.synthetic.fault_query_probability == 0.75
+  assert config.synthetic.center_aligned_views
+  assert config.initial_resolution == (256, 128)
+  assert config.query_chunk_size == 4
+  assert config.steps == 5000
+
+
 def test_unknown_config_is_rejected():
   with pytest.raises(ValueError, match='Unknown PyTorch config'):
     torch_config.get_config('undocumented')

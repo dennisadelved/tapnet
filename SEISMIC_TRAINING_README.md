@@ -1480,6 +1480,41 @@ foreach ($stride in 1, 2, 4) {
 }
 ```
 
+### Large-fault multi-stride fine-tuning
+
+`vdi-fault-robust` keeps 32-frame stride-1/2/4 sampling but expands the model
+depth crop from 128 to 256 samples. The three views are centered on the same
+physical source line. Each faulted scene contains one major 4--80-sample throw
+without dividing the throw by fault count, a 1--8-line reflector-free damage
+core labelled occluded, and a visible displaced continuation. Seventy-five
+percent of queries are drawn from horizon/lateral pairs that cross that core
+when such pairs are available. Twenty percent of scenes remain fault-free.
+
+Start a new optimizer from the encoder-fine-tuned multi-stride weights; do not
+use `--resume` because the data and input resolution changed:
+
+```powershell
+$python = '.\.venv-torch\Scripts\python.exe'
+$sourceCheckpoint = 'S:\Seismic\User\dadel\tapnet\checkpoints\seismic_tapir_torch_vdi_multistride_encoderft3000\latest.pt'
+$faultOutput = 'S:\Seismic\User\dadel\tapnet\checkpoints\seismic_tapir_torch_vdi_faultrobust5000'
+
+& $python -m tapnet.seismic.train_torch `
+  --config vdi-fault-robust `
+  --steps 5000 `
+  --pretrained-checkpoint $sourceCheckpoint `
+  --output-dir $faultOutput `
+  --train-feature-encoder `
+  --encoder-lr-multiplier 0.1 `
+  --checkpoint-every 250 `
+  --device cuda
+```
+
+The 256-by-128 full-encoder CUDA smoke used 2.664 GiB peak allocated memory.
+Real-data inference from this checkpoint must use `--config vdi-fault-robust`
+and should initially keep `--frames-per-view 32`; increasing inference to 128
+frames changes horizontal coverage but not the trained vertical displacement
+distribution.
+
 Run aligned stride-1/2/4 inference on one real source trace:
 
 ```powershell

@@ -7,7 +7,13 @@ import dataclasses
 from tapnet.seismic.synthetic import SyntheticSeismicConfig
 
 
-CONFIG_VARIANTS = ('smoke', 'vdi-small', 'vdi-hard', 'vdi-multistride')
+CONFIG_VARIANTS = (
+    'smoke',
+    'vdi-small',
+    'vdi-hard',
+    'vdi-multistride',
+    'vdi-fault-robust',
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -139,6 +145,37 @@ def get_config(variant: str) -> TorchTrainingConfig:
         initial_resolution=(128, 128),
         pyramid_level=1,
         query_chunk_size=8,
+        warmup_steps=250,
+        learning_rate=5e-5,
+        lateral_loss_weight=1.0,
+    )
+  elif variant == 'vdi-fault-robust':
+    config = TorchTrainingConfig(
+        synthetic=SyntheticSeismicConfig(
+            num_frames=32,
+            height=256,
+            width=128,
+            num_horizons=8,
+            num_queries=16,
+            wavelet_length=25,
+            noise_std=0.18,
+            min_fault_throw=4.0,
+            max_fault_throw=80.0,
+            fault_probability=0.8,
+            max_faults=1,
+            max_fault_offset=0.15,
+            divide_fault_throw_by_count=False,
+            min_fault_damage_width=1,
+            max_fault_damage_width=8,
+            fault_query_probability=0.75,
+            termination_probability=0.2,
+            frame_strides=(1, 2, 4),
+            center_aligned_views=True,
+        ),
+        steps=5000,
+        initial_resolution=(256, 128),
+        pyramid_level=1,
+        query_chunk_size=4,
         warmup_steps=250,
         learning_rate=5e-5,
         lateral_loss_weight=1.0,

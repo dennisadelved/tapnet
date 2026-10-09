@@ -5,6 +5,7 @@ import pytest
 
 from tapnet.seismic.synthetic import SyntheticSeismicConfig
 from tapnet.seismic.synthetic import _make_horizons
+from tapnet.seismic.synthetic import _make_horizons_and_damage
 from tapnet.seismic.synthetic import generate_synthetic_sample
 from tapnet.seismic.synthetic import iter_synthetic_samples
 
@@ -95,6 +96,56 @@ def test_multiple_fault_config_generates_up_to_requested_count():
   assert any(count > 1 for count in counts)
 
 
+def test_large_fault_throw_is_not_divided_and_damage_is_occluded():
+  config = _small_config(
+      num_frames=32,
+      height=192,
+      num_horizons=4,
+      fault_probability=1.0,
+      max_faults=1,
+      min_fault_throw=40.0,
+      max_fault_throw=40.0,
+      divide_fault_throw_by_count=False,
+      min_fault_damage_width=3,
+      max_fault_damage_width=3,
+      termination_probability=0.0,
+  )
+
+  surfaces, visibility, fault_count, damage = _make_horizons_and_damage(
+      config, np.random.default_rng(41)
+  )
+
+  assert fault_count == 1
+  assert np.any(damage)
+  assert np.all(~visibility[:, damage])
+  assert float(np.max(np.abs(np.diff(surfaces, axis=1)))) > 30.0
+
+
+def test_fault_query_bias_selects_tracks_visible_on_both_sides():
+  config = _small_config(
+      num_frames=32,
+      height=192,
+      num_horizons=4,
+      num_queries=32,
+      fault_probability=1.0,
+      min_fault_throw=20.0,
+      max_fault_throw=20.0,
+      min_fault_damage_width=4,
+      max_fault_damage_width=4,
+      fault_query_probability=1.0,
+      termination_probability=0.0,
+      reverse_probability=0.0,
+  )
+
+  sample = generate_synthetic_sample(config, 43)
+
+  for occluded in sample['occluded']:
+    damaged = np.flatnonzero(occluded)
+    assert damaged.size > 0
+    assert np.any(~occluded[:damaged[0]])
+    assert np.any(~occluded[damaged[-1] + 1:])
+
+
 def test_full_termination_probability_always_leaves_valid_query_points():
   config = _small_config(
       num_queries=32,
@@ -136,6 +187,25 @@ def test_multistride_views_are_aligned_subsamples_of_one_scene():
   np.testing.assert_array_equal(views[2]['video'][::2], views[4]['video'][:4])
 
 
+def test_centered_multistride_views_share_the_same_physical_center():
+  config = _small_config(
+      frame_strides=(1, 2, 4), center_aligned_views=True
+  )
+  views = {
+      stride: generate_synthetic_sample(config, 31, frame_stride=stride)
+      for stride in config.frame_strides
+  }
+
+  expected = {
+      1: np.arange(12, 20),
+      2: np.arange(8, 24, 2),
+      4: np.arange(0, 32, 4),
+  }
+  for stride, view in views.items():
+    np.testing.assert_array_equal(view['frame_indices'], expected[stride])
+    assert view['frame_indices'][config.num_frames // 2] == 16
+
+
 def test_multistride_stream_cycles_balanced_strides():
   config = _small_config(frame_strides=(1, 2, 4))
   stream = iter_synthetic_samples(config, seed=37)
@@ -152,6 +222,11 @@ def test_multistride_stream_cycles_balanced_strides():
         {'height': 32},
         {'num_queries': 0},
         {'max_faults': 0},
+        {'min_fault_throw': -1.0},
+        {'min_fault_throw': 3.0, 'max_fault_throw': 2.0},
+        {'max_fault_offset': 1.0},
+        {'min_fault_damage_width': 4, 'max_fault_damage_width': 2},
+        {'fault_query_probability': 1.1},
         {'wavelet_length': 16},
         {'fault_probability': 1.1},
         {'frame_strides': ()},
