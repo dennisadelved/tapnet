@@ -24,4 +24,5 @@ share/python-wheels/
 .venv/
 .venv-torch/
 checkpoints/
+datasets/geological*/
 MANIFEST

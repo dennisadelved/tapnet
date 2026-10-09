@@ -5,6 +5,7 @@ import pytest
 torch = pytest.importorskip('torch')
 
 from tapnet.seismic import synthetic
+from tapnet.seismic import geology
 from tapnet.seismic import torch_data
 
 
@@ -77,4 +78,45 @@ def test_multistride_dataset_is_balanced_and_resume_preserves_stride():
 
   assert strides == [1, 2, 4, 1]
   assert int(resumed['frame_stride']) == 2
+
+
+def test_geological_stream_balances_all_scenario_stride_pairs_and_resumes():
+  config = geology.GeologicalSeismicConfig(
+      num_frames=4, height=64, width=16, num_horizons=8, num_queries=4,
+      wavelet_length=17, max_fault_throw=4, frame_strides=(1, 2),
+      scenarios=('layered', 'unconformity'),
+  )
+  dataset = torch_data.SyntheticSeismicIterableDataset(config, seed=17)
+  stream = iter(dataset)
+  samples = [next(stream) for _ in range(5)]
+  assert [(int(s['scenario_id']), int(s['frame_stride'])) for s in samples] == [
+      (0, 1), (4, 1), (0, 2), (4, 2), (0, 1)
+  ]
+  resumed = next(iter(torch_data.SyntheticSeismicIterableDataset(
+      config, seed=17, start_index=4
+  )))
+  for key in resumed:
+    assert torch.equal(resumed[key], samples[4][key])
+  assert 'rgt' not in resumed  # Dense supervision is optional for TAPIR.
+
+
+def test_geological_workers_partition_the_same_sample_sequence(monkeypatch):
+  from types import SimpleNamespace
+
+  config = geology.GeologicalSeismicConfig(
+      num_frames=4, height=64, width=16, num_horizons=8, num_queries=4,
+      wavelet_length=17, max_fault_throw=4, scenarios=('layered', 'folded'),
+  )
+  dataset = torch_data.SyntheticSeismicIterableDataset(config, seed=19)
+  single = iter(dataset)
+  reference = [next(single) for _ in range(4)]
+  for worker_id in range(2):
+    monkeypatch.setattr(torch_data.data, 'get_worker_info', lambda: SimpleNamespace(
+        id=worker_id, num_workers=2
+    ))
+    stream = iter(dataset)
+    for index in (worker_id, worker_id + 2):
+      sample = next(stream)
+      for key in sample:
+        assert torch.equal(sample[key], reference[index][key])
 

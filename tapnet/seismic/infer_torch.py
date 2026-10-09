@@ -19,6 +19,7 @@ import numpy as np
 import torch
 
 from tapnet.seismic import synthetic
+from tapnet.seismic import geology
 from tapnet.seismic import torch_config
 from tapnet.seismic import train_torch
 
@@ -409,9 +410,19 @@ def main() -> None:
         )[0]
     )
     example_seeds.append(example_seed)
-    sample = synthetic.generate_synthetic_sample(
-        config.synthetic, rng=example_seed, frame_stride=args.frame_stride
-    )
+    if isinstance(config.synthetic, geology.GeologicalSeismicConfig):
+      scenario_count = len(config.synthetic.scenarios)
+      stride = args.frame_stride or config.synthetic.frame_strides[
+          (example_id // scenario_count) % len(config.synthetic.frame_strides)
+      ]
+      sample = geology.generate_geological_sample(
+          config.synthetic, rng=example_seed, frame_stride=stride,
+          scenario=config.synthetic.scenarios[example_id % scenario_count],
+      )
+    else:
+      sample = synthetic.generate_synthetic_sample(
+          config.synthetic, rng=example_seed, frame_stride=args.frame_stride
+      )
     video = torch.from_numpy(sample['video']).unsqueeze(0).to(device)
     queries = torch.from_numpy(sample['query_points']).unsqueeze(0).to(device)
     autocast = (

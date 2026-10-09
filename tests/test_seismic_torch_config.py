@@ -71,6 +71,17 @@ def test_unknown_config_is_rejected():
     torch_config.get_config('undocumented')
 
 
+def test_geology_training_config_uses_all_scenarios_and_multiple_strides():
+  from tapnet.seismic import geology
+
+  config = torch_config.get_config('vdi-geology')
+  assert isinstance(config.synthetic, geology.GeologicalSeismicConfig)
+  assert config.synthetic.scenarios == geology.SCENARIOS
+  assert config.synthetic.frame_strides == (1, 2, 4)
+  assert config.initial_resolution == (128, 128)
+  assert config.steps == 5000
+
+
 def test_cuda_precision_defaults_to_bfloat16():
   config = torch_config.get_config('vdi-small')
 

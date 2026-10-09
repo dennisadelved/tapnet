@@ -9,6 +9,7 @@ import torch
 from torch.utils import data
 
 from tapnet.seismic import synthetic
+from tapnet.seismic import geology
 
 
 class SyntheticSeismicIterableDataset(data.IterableDataset):
@@ -16,7 +17,7 @@ class SyntheticSeismicIterableDataset(data.IterableDataset):
 
   def __init__(
       self,
-      config: synthetic.SyntheticSeismicConfig,
+      config: synthetic.SyntheticSeismicConfig | geology.GeologicalSeismicConfig,
       seed: int = 0,
       start_index: int = 0,
   ) -> None:
@@ -39,12 +40,22 @@ class SyntheticSeismicIterableDataset(data.IterableDataset):
               1, dtype=np.uint64
           )[0]
       )
-      frame_stride = self._config.frame_strides[
-          sample_index % len(self._config.frame_strides)
-      ]
-      sample = synthetic.generate_synthetic_sample(
-          self._config, rng=sample_seed, frame_stride=frame_stride
-      )
+      if isinstance(self._config, geology.GeologicalSeismicConfig):
+        scenario_count = len(self._config.scenarios)
+        frame_stride = self._config.frame_strides[
+            (sample_index // scenario_count) % len(self._config.frame_strides)
+        ]
+        sample = geology.generate_geological_sample(
+            self._config, rng=sample_seed, frame_stride=frame_stride,
+            scenario=self._config.scenarios[sample_index % scenario_count],
+        )
+      else:
+        frame_stride = self._config.frame_strides[
+            sample_index % len(self._config.frame_strides)
+        ]
+        sample = synthetic.generate_synthetic_sample(
+            self._config, rng=sample_seed, frame_stride=frame_stride
+        )
       yield {
           key: torch.from_numpy(np.asarray(value))
           for key, value in sample.items()

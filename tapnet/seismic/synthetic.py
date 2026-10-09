@@ -272,7 +272,7 @@ def _render_amplitudes(
     )
     np.add.at(
         reflectivity,
-        (frame_index, low + 1, lateral_index),
+        (frame_index, np.minimum(low + 1, config.height - 1), lateral_index),
         values * fraction,
     )
 

@@ -61,6 +61,15 @@ It currently includes:
   architecture and checkpoint shape.
 - Deterministic seeds and an infinite training stream.
 
+The paper-inspired geological suite in `tapnet/seismic/geology.py` adds paired
+3D seismic/RGT, structural masks, erosion, clinoforms, and seven balanced
+geological scenarios. It feeds the same TAPIR labels into the native PyTorch
+trainer with `--config vdi-geology`; `geology-smoke` is the CPU sanity check.
+It also exports reproducible whole-scene train/validation/test NPZ splits.
+Commands, label policy, and approximation limits are documented in
+[docs/SYNTHETIC_SEISMIC_SUITE.md](docs/SYNTHETIC_SEISMIC_SUITE.md). Existing
+configs continue to use the original generator.
+
 `tapnet/seismic/dataset.py` wraps the generator as an unbatched
 `tf.data.Dataset`. Existing experiment code still performs per-device and
 device batching. The Kubric import was made lazy so Kubric is not required for
@@ -2015,10 +2024,11 @@ These omissions are material and must not be inferred as implemented:
    velocity, illumination, multiples, diffractions, migration artifacts,
    acquisition footprint, nonstationary wavelets, arbitrary phase rotation,
    anisotropic sampling, or elastic effects.
-6. **Simplified faults and terminations.** Fault throw is shared by the horizon
-   family and reflector termination is a simple planar mask. Fault drag,
-   damage zones, growth faults, unconformity erosion, pinch-outs, and ambiguous
-   cross-fault correlation are absent.
+6. **Simplified faults and terminations.** Legacy configs use shared fault
+   throw and planar termination masks. The geological suite adds erosion-based
+   unconformities, depositional fronts, and paired RGT labels; fault cores/damage
+   masks are supported. Fault drag, growth faults, reverse-fault repetitions,
+   overturned strata, and ambiguous cross-fault correlation remain absent.
 7. **No hard lateral constraint.** Lateral drift is penalized but TAPIR can still
    predict it. Masking the cost volume to a vertical corridor or replacing the
    2D head with a 1D depth head has not been tested.

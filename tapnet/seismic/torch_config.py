@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 
 from tapnet.seismic.synthetic import SyntheticSeismicConfig
+from tapnet.seismic.geology import GeologicalSeismicConfig
 
 
 CONFIG_VARIANTS = (
@@ -13,6 +14,8 @@ CONFIG_VARIANTS = (
     'vdi-hard',
     'vdi-multistride',
     'vdi-fault-robust',
+    'geology-smoke',
+    'vdi-geology',
 )
 
 
@@ -20,7 +23,7 @@ CONFIG_VARIANTS = (
 class TorchTrainingConfig:
   """First-pass single-GPU training configuration."""
 
-  synthetic: SyntheticSeismicConfig
+  synthetic: SyntheticSeismicConfig | GeologicalSeismicConfig
   steps: int
   initial_resolution: tuple[int, int]
   pyramid_level: int
@@ -176,6 +179,35 @@ def get_config(variant: str) -> TorchTrainingConfig:
         initial_resolution=(256, 128),
         pyramid_level=1,
         query_chunk_size=4,
+        warmup_steps=250,
+        learning_rate=5e-5,
+        lateral_loss_weight=1.0,
+    )
+  elif variant == 'geology-smoke':
+    config = TorchTrainingConfig(
+        synthetic=GeologicalSeismicConfig(
+            num_frames=2,
+            height=64,
+            width=64,
+            num_horizons=8,
+            num_queries=2,
+            wavelet_length=17,
+            max_fault_throw=4.0,
+            fault_damage_width=0,
+        ),
+        steps=1,
+        initial_resolution=(64, 64),
+        pyramid_level=0,
+        query_chunk_size=2,
+        num_pips_iter=1,
+    )
+  elif variant == 'vdi-geology':
+    config = TorchTrainingConfig(
+        synthetic=GeologicalSeismicConfig(frame_strides=(1, 2, 4)),
+        steps=5000,
+        initial_resolution=(128, 128),
+        pyramid_level=1,
+        query_chunk_size=8,
         warmup_steps=250,
         learning_rate=5e-5,
         lateral_loss_weight=1.0,
