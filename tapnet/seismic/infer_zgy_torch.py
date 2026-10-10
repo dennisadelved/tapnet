@@ -18,6 +18,7 @@ import numpy as np
 import torch
 
 from tapnet.seismic import infer_torch
+from tapnet.seismic import geology
 from tapnet.seismic import torch_config
 from tapnet.seismic import train_torch
 from tapnet.seismic import zgy
@@ -63,6 +64,21 @@ def _parse_args() -> argparse.Namespace:
   if not 0.0 < args.normalization_percentile <= 100.0:
     parser.error('--normalization-percentile must be in (0, 100].')
   return args
+
+
+def _real_volume_config(config, num_frames=None, frame_strides=(1,)):
+  """Validates model settings; real survey geometry bounds the frame views."""
+  overrides = {
+      'num_frames': num_frames if num_frames is not None else config.synthetic.num_frames,
+      'frame_strides': frame_strides,
+  }
+  if isinstance(config.synthetic, geology.GeologicalSeismicConfig):
+    overrides['scene_num_frames'] = None
+  config = dataclasses.replace(
+      config, synthetic=dataclasses.replace(config.synthetic, **overrides)
+  )
+  config.validate()
+  return config
 
 
 def _window_and_video(
@@ -286,15 +302,7 @@ def _write_curtain(
 
 def main() -> None:
   args = _parse_args()
-  config = torch_config.get_config(args.config)
-  if args.num_frames is not None:
-    config = dataclasses.replace(
-        config,
-        synthetic=dataclasses.replace(
-            config.synthetic, num_frames=args.num_frames
-        ),
-    )
-    config.validate()
+  config = _real_volume_config(torch_config.get_config(args.config), args.num_frames)
   device = train_torch._select_device(args.device)
   model_state, checkpoint_metadata = infer_torch._load_model_checkpoint(
       args.checkpoint, device

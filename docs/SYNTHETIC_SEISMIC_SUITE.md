@@ -77,6 +77,14 @@ python -m tapnet.seismic.train_torch --config vdi-geology --frame-stride 1 --dev
 This retains the full 256-cubed source volume and 64-frame view length; only the
 stride mix changes. The override is stored in the checkpoint configuration.
 
+For stride-1 peak-seeded inference on real ZGY data, use
+`tapnet.seismic.infer_zgy_peaks_torch --config vdi-geology --num-frames 128`
+with the input/checkpoint/output and query arguments. The single-stride reader
+uses contiguous survey lines. The multi-stride entry point instead accepts
+`--frames-per-view` and `--frame-strides`. Real inference validates view bounds
+against the ZGY survey geometry, independently of the synthetic source-frame
+limit used during training; model image dimensions still match the checkpoint.
+
 The new geometry and source/view dimensions change the scene distribution and
 labels. Re-export old
 NPZ datasets to a new destination. An old geological training checkpoint can

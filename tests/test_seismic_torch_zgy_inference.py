@@ -40,6 +40,30 @@ def _geometry(size=(70, 80, 90)):
   )
 
 
+@pytest.mark.parametrize('strides', ((1,), (1, 2, 4)))
+def test_real_geology_inference_can_exceed_synthetic_scene_frame_limit(strides):
+  training = torch_config.get_config('vdi-geology')
+  with pytest.raises(ValueError, match='scene_num_frames'):
+    dataclasses.replace(
+        training, synthetic=dataclasses.replace(training.synthetic, num_frames=128)
+    ).validate()
+  inference = infer_zgy_torch._real_volume_config(training, 128, strides)
+  assert inference.synthetic.num_frames == 128
+  assert inference.synthetic.frame_strides == strides
+  assert inference.synthetic.scene_num_frames is None
+  assert inference.initial_resolution == (256, 256)
+  assert training.synthetic.scene_num_frames == 256
+
+
+def test_single_stride_real_config_preserves_legacy_model_settings():
+  training = torch_config.get_config('vdi-multistride')
+  inference = infer_zgy_torch._real_volume_config(training, 128)
+  assert inference.synthetic.frame_strides == (1,)
+  assert inference.synthetic.num_frames == 128
+  assert inference.initial_resolution == training.initial_resolution
+  assert inference.pyramid_level == training.pyramid_level
+
+
 def test_inline_sweep_transposes_zgy_axes_to_frame_depth_lateral():
   config = torch_config.get_config('smoke')
   values = np.arange(70 * 80 * 90, dtype=np.float32).reshape(70, 80, 90)

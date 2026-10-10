@@ -930,14 +930,7 @@ def main() -> None:
     raise ValueError(
         'Multi-stride inference requires at least two configured strides.'
     )
-  if args.frames_per_view is not None:
-    config = dataclasses.replace(
-        config,
-        synthetic=dataclasses.replace(
-            config.synthetic, num_frames=args.frames_per_view
-        ),
-    )
-  config.validate()
+  config = infer_zgy_torch._real_volume_config(config, frame_count, frame_strides)
   device = train_torch._select_device(args.device)
   model_state, checkpoint_metadata = infer_torch._load_model_checkpoint(
       args.checkpoint, device

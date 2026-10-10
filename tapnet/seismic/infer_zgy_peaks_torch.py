@@ -587,15 +587,9 @@ def _write_curtain(
 
 def main() -> None:
   args = _parse_args()
-  config = torch_config.get_config(args.config)
-  if args.num_frames is not None:
-    config = dataclasses.replace(
-        config,
-        synthetic=dataclasses.replace(
-            config.synthetic, num_frames=args.num_frames
-        ),
-    )
-    config.validate()
+  config = infer_zgy_torch._real_volume_config(
+      torch_config.get_config(args.config), args.num_frames
+  )
   device = train_torch._select_device(args.device)
   model_state, checkpoint_metadata = infer_torch._load_model_checkpoint(
       args.checkpoint, device
